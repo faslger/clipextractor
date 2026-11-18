@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Clipper - open a video, seek around, mark a start/end, export a clip as mp4 or mp3.
+Clipper - open a video or audio file, seek around, mark a start/end, and
+export the marked range to many formats (mp4, webm, mkv, mov, mp3, wav,
+ogg, flac, m4a, opus).
 
 Requirements:
     pip install PySide6
     ffmpeg installed and on your PATH  (https://ffmpeg.org/download.html)
 
 Run:
-    python clipper.py [optional_video.mp4]
+    python clipper.py [optional_media_file]
 
 Shortcuts:
     Space       play / pause
@@ -37,6 +39,40 @@ from PySide6.QtWidgets import (
     QMessageBox, QPushButton, QSlider, QVBoxLayout, QWidget,
 )
 
+# Extensions we treat as audio-only inputs: they play sound but have no
+# frames, so the video pane is hidden when one of these is loaded.
+AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".oga", ".flac", ".m4a", ".aac",
+              ".opus", ".wma"}
+
+# Every format we can export to, and how to produce it:
+#   "copy" - stream copy (-c copy) is allowed for this output format
+#   "args" - ffmpeg arguments used when re-encoding into this format
+# Audio formats include -vn so any video stream in the input is dropped.
+EXPORT_FORMATS = {
+    "mp4":  {"copy": True,  "args": ["-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                                     "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]},
+    "webm": {"copy": True,  "args": ["-c:v", "libvpx-vp9", "-row-mt", "1", "-crf", "30",
+                                     "-b:v", "0", "-c:a", "libopus", "-b:a", "160k"]},
+    "mkv":  {"copy": True,  "args": ["-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                                     "-c:a", "aac", "-b:a", "192k"]},
+    "mov":  {"copy": True,  "args": ["-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                                     "-c:a", "aac", "-b:a", "192k"]},
+    "mp3":  {"copy": False, "args": ["-vn", "-c:a", "libmp3lame", "-q:a", "2"]},
+    "wav":  {"copy": True,  "args": ["-vn", "-c:a", "pcm_s16le"]},
+    "ogg":  {"copy": True,  "args": ["-vn", "-c:a", "libvorbis", "-q:a", "5"]},
+    "flac": {"copy": True,  "args": ["-vn", "-c:a", "flac"]},
+    "m4a":  {"copy": True,  "args": ["-vn", "-c:a", "aac", "-b:a", "192k"]},
+    "opus": {"copy": True,  "args": ["-vn", "-c:a", "libopus", "-b:a", "160k"]},
+}
+
+# File-picker filter: a broad list of video and audio inputs.
+OPEN_FILTER = (
+    "Video files (*.mp4 *.mov *.mkv *.webm *.avi *.m4v *.mpg *.mpeg *.ts "
+    "*.wmv *.flv *.3gp);;"
+    f"Audio files ({' '.join('*' + e for e in sorted(AUDIO_EXTS))});;"
+    "All files (*)"
+)
+
 
 def fmt(ms: int) -> str:
     """Turn milliseconds into a readable HH:MM:SS.mmm string.
@@ -60,7 +96,7 @@ class Clipper(QWidget):
         self.resize(900, 650)
 
         # ---------- state ----------
-        self.path: Path | None = None   # currently loaded video file
+        self.path: Path | None = None   # currently loaded media file
         self.start_ms = 0               # clip start marker
         self.end_ms = 0                 # clip end marker (0 = not set yet)
         self.previewing = False         # True while "Preview" is playing the range
@@ -77,7 +113,7 @@ class Clipper(QWidget):
 
         # ---------- widgets ----------
         # Transport row: open file, play/pause, current time display
-        self.open_btn = QPushButton("Open video…")
+        self.open_btn = QPushButton("Open media…")
         self.play_btn = QPushButton("Play / Pause")
         self.slider = QSlider(Qt.Horizontal)   # the seek bar
         self.slider.setRange(0, 0)             # real range is set once duration is known
@@ -91,10 +127,13 @@ class Clipper(QWidget):
 
         # Export row: output format, fast-copy option, export button
         self.format_box = QComboBox()
-        self.format_box.addItems(["mp4", "mp3"])
+        self.format_box.addItems(list(EXPORT_FORMATS))
         self.fast_check = QCheckBox("Fast copy (no re-encode, cuts on keyframes)")
+        self.fast_check.setToolTip(
+            "Copy the streams as-is instead of re-encoding. Only works when the "
+            "source codecs are compatible with the chosen output container.")
         self.export_btn = QPushButton("Export clip…")
-        self.status = QLabel("Open a video to begin.")
+        self.status = QLabel("Open a video or audio file to begin.")
 
         # ---------- layout ----------
         # Each row is a horizontal layout; they're stacked in a vertical one.
@@ -133,9 +172,10 @@ class Clipper(QWidget):
         self.preview_btn.clicked.connect(self.preview)
         self.export_btn.clicked.connect(self.export)
 
-        # "Fast copy" only makes sense for mp4, so grey it out for mp3.
+        # "Fast copy" is only offered for output formats that allow stream copy.
         self.format_box.currentTextChanged.connect(
-            lambda t: self.fast_check.setEnabled(t == "mp4"))
+            lambda t: self.fast_check.setEnabled(
+                EXPORT_FORMATS.get(t, {}).get("copy", False)))
 
         # Dragging the slider seeks the player. Clicking on the bar also
         # jumps there (sliderPressed), not just dragging.
@@ -168,23 +208,26 @@ class Clipper(QWidget):
     # File loading and playback
     # ------------------------------------------------------------------
     def open_dialog(self):
-        """Show a file picker and load the chosen video."""
+        """Show a file picker and load the chosen media file."""
         f, _ = QFileDialog.getOpenFileName(
-            self, "Open video", "",
-            "Video files (*.mp4 *.mov *.mkv *.webm *.avi *.m4v);;All files (*)")
+            self, "Open media file", "", OPEN_FILTER)
         if f:  # empty string means the user cancelled
             self.load(Path(f))
 
     def load(self, path: Path):
-        """Load a video into the player and reset the markers."""
+        """Load a media file into the player and reset the markers."""
         self.path = path
         # Qt wants a URL, not a plain path; resolve() makes it absolute first.
         self.player.setSource(QUrl.fromLocalFile(str(path.resolve())))
         self.start_ms = 0
         self.end_ms = 0  # will be filled in by on_duration once Qt knows the length
         self.player.pause()  # show the first frame without auto-playing
+        # Audio-only files have no frames to show, so hide the video pane.
+        is_audio = path.suffix.lower() in AUDIO_EXTS
+        self.video.setVisible(not is_audio)
         self.setWindowTitle(f"Clipper - {path.name}")
-        self.status.setText(f"Loaded {path.name}")
+        self.status.setText(
+            f"Loaded {path.name}" + (" (audio only)" if is_audio else ""))
 
     def toggle_play(self):
         """Play if paused, pause if playing."""
@@ -256,7 +299,7 @@ class Clipper(QWidget):
         """Ask where to save, build an ffmpeg command, and run it."""
         # --- sanity checks before doing anything ---
         if not self.path:
-            QMessageBox.information(self, "Clipper", "Open a video first.")
+            QMessageBox.information(self, "Clipper", "Open a media file first.")
             return
         if not shutil.which("ffmpeg"):  # looks for ffmpeg on the PATH
             QMessageBox.critical(self, "Clipper",
@@ -267,11 +310,12 @@ class Clipper(QWidget):
             return
 
         # --- choose the output file ---
-        ext = self.format_box.currentText()          # "mp4" or "mp3"
+        ext = self.format_box.currentText()          # e.g. "mp4", "webm", "wav"
+        spec = EXPORT_FORMATS[ext]
         default = f"{self.path.stem}_clip.{ext}"     # e.g. holiday_clip.mp4
         out, _ = QFileDialog.getSaveFileName(
             self, "Export clip", str(self.path.with_name(default)),
-            f"{ext.upper()} (*.{ext})")
+            f"{ext.upper()} (*.{ext});;All files (*)")
         if not out:
             return  # user cancelled
         if not out.lower().endswith(f".{ext}"):
@@ -289,24 +333,17 @@ class Clipper(QWidget):
         #   -t        how long the clip should be (duration, not end time)
         args = ["-y", "-ss", start, "-i", str(self.path), "-t", dur]
 
-        if ext == "mp3":
-            # -vn         drop the video stream
-            # libmp3lame  the MP3 encoder
-            # -q:a 2      high-quality variable bitrate (~190 kbps)
-            args += ["-vn", "-c:a", "libmp3lame", "-q:a", "2"]
-        elif self.fast_check.isChecked():
+        if self.fast_check.isChecked() and spec["copy"]:
             # -c copy: copy the streams as-is, no re-encoding (very fast, but
             #          can only cut on keyframes so the start may be slightly off).
             # -avoid_negative_ts make_zero: fixes timestamp quirks from the cut.
             args += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
         else:
-            # Re-encode for a frame-accurate cut:
-            #   libx264 + crf 20   good-quality H.264 video (lower crf = better/larger)
-            #   -preset fast       encoding speed vs. file size trade-off
-            #   aac 192k           standard audio codec/bitrate for mp4
-            #   +faststart         lets the clip start playing before fully downloaded
-            args += ["-c:v", "libx264", "-preset", "fast", "-crf", "20",
-                     "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+            # Re-encode into the chosen format; each format lists its own args
+            # in EXPORT_FORMATS (e.g. libx264+aac for mp4, vp9+opus for webm,
+            # -vn + pcm_s16le for wav). Audio-only input into a video format
+            # just yields a container with an audio stream.
+            args += spec["args"]
         args.append(out)  # the output path always goes last
 
         # --- run ffmpeg in the background ---
