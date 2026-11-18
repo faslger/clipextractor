@@ -46,24 +46,24 @@ AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".oga", ".flac", ".m4a", ".aac",
               ".opus", ".wma"}
 
 # Every format we can export to, and how to produce it:
-#   "copy" - stream copy (-c copy) is allowed for this output format
-#   "args" - ffmpeg arguments used when re-encoding into this format
-# Audio formats include -vn so any video stream in the input is dropped.
+#   "copy"  - stream copy (-c copy) is allowed for this output format
+#   "audio" - format is audio-only (its args already include -vn)
+#   "args"  - ffmpeg arguments used when re-encoding into this format
 EXPORT_FORMATS = {
-    "mp4":  {"copy": True,  "args": ["-c:v", "libx264", "-preset", "fast", "-crf", "20",
-                                     "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]},
-    "webm": {"copy": True,  "args": ["-c:v", "libvpx-vp9", "-row-mt", "1", "-crf", "30",
-                                     "-b:v", "0", "-c:a", "libopus", "-b:a", "160k"]},
-    "mkv":  {"copy": True,  "args": ["-c:v", "libx264", "-preset", "fast", "-crf", "20",
-                                     "-c:a", "aac", "-b:a", "192k"]},
-    "mov":  {"copy": True,  "args": ["-c:v", "libx264", "-preset", "fast", "-crf", "20",
-                                     "-c:a", "aac", "-b:a", "192k"]},
-    "mp3":  {"copy": False, "args": ["-vn", "-c:a", "libmp3lame", "-q:a", "2"]},
-    "wav":  {"copy": True,  "args": ["-vn", "-c:a", "pcm_s16le"]},
-    "ogg":  {"copy": True,  "args": ["-vn", "-c:a", "libvorbis", "-q:a", "5"]},
-    "flac": {"copy": True,  "args": ["-vn", "-c:a", "flac"]},
-    "m4a":  {"copy": True,  "args": ["-vn", "-c:a", "aac", "-b:a", "192k"]},
-    "opus": {"copy": True,  "args": ["-vn", "-c:a", "libopus", "-b:a", "160k"]},
+    "mp4":  {"copy": True,  "audio": False, "args": ["-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                                                      "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]},
+    "webm": {"copy": True,  "audio": False, "args": ["-c:v", "libvpx-vp9", "-row-mt", "1", "-crf", "30",
+                                                      "-b:v", "0", "-c:a", "libopus", "-b:a", "160k"]},
+    "mkv":  {"copy": True,  "audio": False, "args": ["-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                                                      "-c:a", "aac", "-b:a", "192k"]},
+    "mov":  {"copy": True,  "audio": False, "args": ["-c:v", "libx264", "-preset", "fast", "-crf", "20",
+                                                      "-c:a", "aac", "-b:a", "192k"]},
+    "mp3":  {"copy": False, "audio": True,  "args": ["-vn", "-c:a", "libmp3lame", "-q:a", "2"]},
+    "wav":  {"copy": True,  "audio": True,  "args": ["-vn", "-c:a", "pcm_s16le"]},
+    "ogg":  {"copy": True,  "audio": True,  "args": ["-vn", "-c:a", "libvorbis", "-q:a", "5"]},
+    "flac": {"copy": True,  "audio": True,  "args": ["-vn", "-c:a", "flac"]},
+    "m4a":  {"copy": True,  "audio": True,  "args": ["-vn", "-c:a", "aac", "-b:a", "192k"]},
+    "opus": {"copy": True,  "audio": True,  "args": ["-vn", "-c:a", "libopus", "-b:a", "160k"]},
 }
 
 # File-picker filter: a broad list of video and audio inputs.
@@ -185,9 +185,13 @@ class Clipper(QWidget):
         self.preview_btn.setToolTip("Play only the marked range (P)")
         self.range_lbl = QLabel("Start: --    End: --")
 
-        # Export controls: output format, fast-copy option, export button
+        # Export controls: output format, audio-only option, fast copy, button
         self.format_box = QComboBox()
         self.format_box.addItems(list(EXPORT_FORMATS))
+        self.audio_only_check = QCheckBox("Audio only")
+        self.audio_only_check.setToolTip(
+            "Drop the video stream and export sound only (ffmpeg -vn), even for "
+            "video containers like mp4 or webm.")
         self.fast_check = QCheckBox("Fast copy")
         self.fast_check.setToolTip(
             "Copy the streams as-is instead of re-encoding: very fast, but cuts "
@@ -220,6 +224,7 @@ class Clipper(QWidget):
         export = QHBoxLayout()
         export.addWidget(QLabel("Format:"))
         export.addWidget(self.format_box)
+        export.addWidget(self.audio_only_check)
         export.addWidget(self.fast_check)
         export.addStretch(1)
         export.addWidget(self.export_btn)
@@ -241,10 +246,10 @@ class Clipper(QWidget):
         self.preview_btn.clicked.connect(self.preview)
         self.export_btn.clicked.connect(self.export)
 
-        # "Fast copy" is only offered for output formats that allow stream copy.
-        self.format_box.currentTextChanged.connect(
-            lambda t: self.fast_check.setEnabled(
-                EXPORT_FORMATS.get(t, {}).get("copy", False)))
+        # Fast copy is only offered for formats that allow stream copy; the
+        # "Audio only" box is redundant for formats that already drop video.
+        self.format_box.currentTextChanged.connect(self.update_export_options)
+        self.update_export_options(self.format_box.currentText())
 
         # Dragging the slider seeks the player. Clicking on the bar also
         # jumps there (sliderPressed), not just dragging.
@@ -366,6 +371,12 @@ class Clipper(QWidget):
     # ------------------------------------------------------------------
     # Export (runs ffmpeg)
     # ------------------------------------------------------------------
+    def update_export_options(self, text):
+        """Enable/disable the export checkboxes for the chosen format."""
+        spec = EXPORT_FORMATS.get(text, {})
+        self.fast_check.setEnabled(spec.get("copy", False))
+        self.audio_only_check.setEnabled(not spec.get("audio", False))
+
     def export(self):
         """Ask where to save, build an ffmpeg command, and run it."""
         # --- sanity checks before doing anything ---
@@ -415,6 +426,9 @@ class Clipper(QWidget):
             # -vn + pcm_s16le for wav). Audio-only input into a video format
             # just yields a container with an audio stream.
             args += spec["args"]
+        if self.audio_only_check.isChecked() and not spec["audio"]:
+            # Strip the video stream from a video-container export.
+            args += ["-vn"]
         args.append(out)  # the output path always goes last
 
         # --- run ffmpeg in the background ---
