@@ -2,8 +2,10 @@
 
 A small desktop app for cutting clips out of video **or audio** files. Open a
 file, scrub through it, mark a start and end point (shown as a highlighted
-range on the seek bar), and export the selection to many formats. The
-original file is never modified.
+range on the seek bar), and export the selection to many formats. Marked
+ranges can also be collected into a clip list and exported all at once — one
+file per clip, or all joined into a single file. The original file is never
+modified.
 
 ## Features
 
@@ -92,6 +94,7 @@ the end of the file.
 | `I`                | Set start marker at current position |
 | `O`                | Set end marker at current position  |
 | `A`                | Add the marked range to the clip list |
+| `F2`               | Rename the selected clip in the clip list |
 | `P`                | Preview the selected range          |
 | `←` / `→`          | Seek back / forward 1 second        |
 | `Shift` + `←` / `→`| Seek back / forward 5 seconds       |
@@ -131,7 +134,7 @@ ignored for **audio-only** exports.
 ## Help
 
 - **Help** (main window): user guide covering the workflow, shortcuts, the
-  seek-bar markers, and the export row.
+  seek-bar markers, the waveform, the clip list, and the export row.
 - **?** (inside the Options popup): explains every option in that dialog.
 
 ## How it works
@@ -141,6 +144,9 @@ ignored for **audio-only** exports.
 - **ffmpeg** does the cutting and conversion. It is launched in the
   background with `QProcess`, so the interface stays responsive during
   export.
+- The waveform is also produced by ffmpeg: it decodes the audio to mono PCM,
+  the app buckets it into 10 ms RMS levels and paints them on an absolute
+  dBFS scale (−60…0 dB mapped to bar height and green/yellow/red).
 - All times are stored internally in milliseconds, the unit Qt's media player
   uses, and converted to seconds only when the ffmpeg command is built.
 
@@ -150,6 +156,17 @@ The ffmpeg command it runs looks roughly like this (mp4 re-encode mode):
 ffmpeg -y -ss <start> -i input.mp4 -t <duration> \
        -c:v libx264 -preset fast -crf 20 -c:a aac -b:a 192k -movflags +faststart \
        output.mp4
+```
+
+With several clips in the clip list, one such job per clip is queued and run
+sequentially (`name_<clipname>.mp4`, …). **Join** instead runs a single ffmpeg
+process with one `-ss/-t -i` input per clip and a `concat` filter, which keeps
+the cuts frame-accurate:
+
+```
+ffmpeg -y -ss <start1> -t <dur1> -i input.mp4 -ss <start2> -t <dur2> -i input.mp4 \
+       -filter_complex "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]" \
+       -map "[v]" -map "[a]" -c:v libx264 ... output.mp4
 ```
 
 Export formats live in the `EXPORT_FORMATS` table at the top of
@@ -162,6 +179,7 @@ arguments used when re-encoding, so adding a format is a one-line change.
 - **File won't play or shows a black screen**: Qt uses your system's media codecs. Try a different file, or on Linux install the GStreamer plugins (`sudo apt install gstreamer1.0-libav gstreamer1.0-plugins-good`). Exporting still works via ffmpeg even if preview doesn't.
 - **Fast-copy clip starts at the wrong spot or has a frozen first frame**: that's the keyframe limitation. Untick *Fast copy* for an exact cut.
 - **Export failed**: an error dialog shows the tail of ffmpeg's log. The cause (bad path, unsupported codec, no write permission) is usually in the last few lines.
+- **Waveform shows a placeholder instead of bars**: the file has no audio track, or ffmpeg isn't on the `PATH` (the analysis runs through ffmpeg).
 
 ## Ideas for extending
 

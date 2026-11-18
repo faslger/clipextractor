@@ -25,8 +25,8 @@ Shortcuts:
 
 The "Help" button (and the "?" button in the Options popup) open guide
 windows explaining how to set and configure everything.
-A waveform strip under the seek bar shows where the audio is loud
-(green/yellow/red bars).
+A waveform strip under the seek bar shows where the audio is loud, on an
+absolute dB scale (green = quiet, yellow = medium, red = loud).
 
 How it is put together:
     * PySide6 (Qt) provides the window, the video player and the buttons.
