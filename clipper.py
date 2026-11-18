@@ -22,6 +22,8 @@ Shortcuts:
 
 The "Help" button (and the "?" button in the Options popup) open guide
 windows explaining how to set and configure everything.
+A waveform strip under the seek bar shows where the audio is loud
+(green/yellow/red bars).
 
 How it is put together:
     * PySide6 (Qt) provides the window, the video player and the buttons.
@@ -32,20 +34,22 @@ How it is put together:
       because that is what Qt's media player uses. We only convert to
       seconds when building the ffmpeg command.
 """
+import array
+import math
 import shlex
 import shutil
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QRect, Qt, QProcess, QUrl
+from PySide6.QtCore import QRect, QRectF, Qt, QProcess, QUrl
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QPalette, QPen, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-    QPushButton, QSlider, QStyle, QStyleOptionSlider, QTextBrowser, QVBoxLayout,
-    QWidget,
+    QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QMessageBox, QPushButton, QSlider, QStyle, QStyleOptionSlider, QTextBrowser,
+    QVBoxLayout, QWidget,
 )
 
 # Extensions we treat as audio-only inputs: they play sound but have no
@@ -81,6 +85,13 @@ OPEN_FILTER = (
     f"Audio files ({' '.join('*' + e for e in sorted(AUDIO_EXTS))});;"
     "All files (*)"
 )
+
+# Waveform analysis: the audio is decoded to mono PCM at WAVE_RATE Hz and
+# bucketed into RMS levels every WAVE_BUCKET_MS milliseconds. Painting
+# aggregates the buckets down to one bar per pixel column, so the strip is
+# as high-resolution as the window is wide.
+WAVE_RATE = 8000
+WAVE_BUCKET_MS = 10
 
 
 def fmt(ms: int) -> str:
@@ -147,6 +158,90 @@ class MarkerSlider(QSlider):
         r = self.rect()
         p.drawLine(x1, r.top() + 1, x1, r.bottom() - 1)
         p.drawLine(x2, r.top() + 1, x2, r.bottom() - 1)
+        p.end()
+
+
+class WaveformView(QWidget):
+    """Strip below the seek bar showing audio activity over time.
+
+    `levels` holds one RMS level (0..1) per WAVE_BUCKET_MS bucket; painting
+    aggregates buckets into one bottom-anchored bar per pixel column, colored
+    green (quiet), yellow or red (loud). `duration_ms` + `inset` map time to
+    pixels exactly like the seek bar's groove, and a white stripe marks the
+    current playback position.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.levels: list[float] = []
+        self.placeholder = ""   # text drawn when there are no levels
+        self.duration_ms = 0    # total media duration (0 = unknown)
+        self.inset = 0.0        # px trimmed each side to match the slider groove
+        self.playhead_ms = -1   # current position; < 0 hides the white stripe
+        self.setMinimumHeight(40)
+        self.setMaximumHeight(60)
+
+    def set_levels(self, levels: list[float], placeholder: str = ""):
+        self.levels = levels
+        self.placeholder = placeholder
+        self.update()
+
+    def set_timeline(self, duration_ms: int, inset: float):
+        """Set the time->pixel mapping so the strip lines up with the slider."""
+        self.duration_ms = duration_ms
+        self.inset = inset
+        self.update()
+
+    def set_playhead(self, ms: int):
+        """Move the white position stripe (ms); negative hides it."""
+        self.playhead_ms = ms
+        self.update()
+
+    def _x_for(self, ms: float) -> float:
+        """Pixel x for a time in ms, using the same mapping as the slider."""
+        span = max(1.0, self.width() - 2 * self.inset)
+        return self.inset + (ms / self.duration_ms) * span
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.fillRect(self.rect(), self.palette().color(QPalette.Window))
+        w, h = self.width(), self.height()
+        n = len(self.levels)
+        if n and self.duration_ms > 0:
+            # one bar per pixel column across the groove area; each column
+            # shows the peak level of the buckets that fall into it
+            x0 = int(self.inset)
+            x1 = max(x0 + 1, int(w - self.inset))
+            span = max(1.0, w - 2 * self.inset)
+            for cx in range(x0, x1):
+                i0 = max(0, int((cx - self.inset) * self.duration_ms / span / WAVE_BUCKET_MS))
+                i1 = int((cx + 1 - self.inset) * self.duration_ms / span / WAVE_BUCKET_MS) + 1
+                i0 = min(i0, n - 1)                    # clamp into range so the
+                i1 = max(i0 + 1, min(n, i1))            # slice is never empty
+                lv = max(self.levels[i0:i1])
+                bh = max(1.0, lv * (h - 4))
+                if lv < 0.4:
+                    c = QColor(76, 175, 80)    # green: quiet
+                elif lv < 0.75:
+                    c = QColor(255, 193, 7)    # yellow: medium
+                else:
+                    c = QColor(244, 67, 54)    # red: loud
+                p.fillRect(QRectF(cx, h - bh, 1.0, bh), c)
+        elif n:
+            # duration not known yet: plain full-width bars
+            for cx in range(w):
+                i0 = cx * n // w
+                i1 = max(i0 + 1, (cx + 1) * n // w)
+                lv = max(self.levels[i0:i1])
+                bh = max(1.0, lv * (h - 4))
+                p.fillRect(QRectF(cx, h - bh, 1.0, bh), QColor(120, 160, 220))
+        elif self.placeholder:
+            p.setPen(self.palette().color(QPalette.Mid))
+            p.drawText(self.rect(), Qt.AlignCenter, self.placeholder)
+        # white stripe for the current playback position
+        if self.duration_ms > 0 and self.playhead_ms >= 0:
+            x = self._x_for(min(self.playhead_ms, self.duration_ms))
+            p.fillRect(QRectF(x - 1, 0, 2, h), QColor(255, 255, 255))
         p.end()
 
 
@@ -357,6 +452,11 @@ press <b>O</b> (or "Set end"), pick a format, then press <b>Export…</b>.</p>
 <p>The highlighted band and the two vertical lines on the seek bar show the
 marked start/end range. Dragging the bar seeks; the playhead handle stays
 visible inside the band. Clicking the bar jumps straight to that position.</p>
+<p>The strip directly below the seek bar is a waveform of the audio, aligned
+with the seek bar above it: each pixel column is one slice of time, colored
+green (quiet), yellow or red (loud), and a white stripe marks the current
+playback position. Files without an audio track show a "No audio track"
+placeholder instead.</p>
 
 <h3>Transport &amp; markers</h3>
 <ul>
@@ -458,7 +558,11 @@ class Clipper(QWidget):
         self.start_ms = 0               # clip start marker
         self.end_ms = 0                 # clip end marker (0 = not set yet)
         self.previewing = False         # True while "Preview" is playing the range
-        self.proc: QProcess | None = None  # the running ffmpeg process, if any
+        self.proc: QProcess | None = None  # the running ffmpeg export, if any
+        self.wave_proc: QProcess | None = None  # ffmpeg analysis for the waveform
+        self.wave_buf = bytearray()     # leftover bytes of the pcm stream
+        self.wave_acc = 0.0             # sum of squares in the current bucket
+        self.wave_cnt = 0               # samples in the current bucket
 
         # ---------- player ----------
         # Qt splits playback into three objects: the player decodes the file,
@@ -474,6 +578,10 @@ class Clipper(QWidget):
         self.slider = MarkerSlider(Qt.Horizontal)
         self.slider.setRange(0, 0)             # real range is set once duration is known
         self.time_lbl = QLabel("00:00:00.000 / 00:00:00.000")
+        # Audio-activity strip shown below the seek bar once a file is analyzed.
+        self.wave = WaveformView()
+        self.wave.setToolTip("Audio activity over time (green = quiet, red = loud)")
+        self.wave.setVisible(False)
 
         # Buttons; shortcut hints live in tooltips to keep the labels short.
         self.open_btn = QPushButton("Open…")
@@ -513,10 +621,14 @@ class Clipper(QWidget):
         self.opts_dlg = ExportOptionsDialog(self)
 
         # ---------- layout ----------
-        # Row 1: seek bar with the time readout at its right end.
-        seek = QHBoxLayout()
-        seek.addWidget(self.slider, 1)   # stretch=1: slider takes the spare space
-        seek.addWidget(self.time_lbl)
+        # Seek bar and waveform share a 2-column grid, so the waveform lines
+        # up exactly with the seek bar: column 0 stretches (slider / wave),
+        # column 1 holds the time readout.
+        seek = QGridLayout()
+        seek.setColumnStretch(0, 1)
+        seek.addWidget(self.slider, 0, 0)
+        seek.addWidget(self.time_lbl, 0, 1)
+        seek.addWidget(self.wave, 1, 0)
 
         # Row 2: transport buttons, a separator, then the clip-range buttons;
         # the start/end readout fills the remaining space on the right.
@@ -611,13 +723,80 @@ class Clipper(QWidget):
         self.start_ms = 0
         self.end_ms = 0  # will be filled in by on_duration once Qt knows the length
         self.slider.set_marks(0, 0)  # clear any old marks on the seek bar
+        self.wave.set_timeline(0, self._slider_inset())  # until duration is known
+        self.wave.set_playhead(-1)
         self.player.pause()  # show the first frame without auto-playing
+        self.start_waveform(path)
         # Audio-only files have no frames to show, so hide the video pane.
         is_audio = path.suffix.lower() in AUDIO_EXTS
         self.video.setVisible(not is_audio)
         self.setWindowTitle(f"Clipper - {path.name}")
         self.status.setText(
             f"Loaded {path.name}" + (" (audio only)" if is_audio else ""))
+
+    # ------------------------------------------------------------------
+    # Waveform (audio-activity strip under the seek bar)
+    # ------------------------------------------------------------------
+    def start_waveform(self, path: Path):
+        """Analyze the file's audio with ffmpeg and fill the waveform strip."""
+        if not shutil.which("ffmpeg"):
+            self.wave.set_levels([], "ffmpeg not found — no waveform")
+            self.wave.setVisible(True)
+            return
+        if self.wave_proc is not None:  # an older analysis is still running
+            self.wave_proc.finished.disconnect()
+            self.wave_proc.kill()
+            self.wave_proc = None
+        self.wave.set_levels([], "Analyzing audio…")
+        self.wave.setVisible(True)
+        self.wave_buf = bytearray()
+        self.wave_acc = 0.0
+        self.wave_cnt = 0
+        self.wave_proc = QProcess(self)
+        self.wave_proc.readyReadStandardOutput.connect(self._wave_read)
+        self.wave_proc.finished.connect(self._wave_done)
+        # Decode to mono float32 PCM at WAVE_RATE Hz on stdout; we bucket the
+        # samples into RMS levels ourselves as they stream in.
+        self.wave_proc.start("ffmpeg", ["-v", "error", "-i", str(path), "-vn",
+                                        "-ac", "1", "-ar", str(WAVE_RATE),
+                                        "-f", "f32le", "-"])
+
+    def _wave_read(self):
+        """Consume a chunk of PCM samples into per-bucket RMS levels."""
+        self.wave_buf += bytes(self.wave_proc.readAllStandardOutput())
+        n = len(self.wave_buf) // 4          # float32 = 4 bytes per sample
+        if not n:
+            return
+        samples = array.array("f")
+        samples.frombytes(bytes(self.wave_buf[:n * 4]))
+        del self.wave_buf[:n * 4]            # keep a partial sample for later
+        bucket = WAVE_RATE * WAVE_BUCKET_MS // 1000   # samples per bucket
+        levels = self.wave.levels
+        for x in samples:
+            self.wave_acc += x * x
+            self.wave_cnt += 1
+            if self.wave_cnt == bucket:
+                levels.append(math.sqrt(self.wave_acc / self.wave_cnt))
+                self.wave_acc = 0.0
+                self.wave_cnt = 0
+        self.wave.update()
+
+    def _wave_done(self, code, _status):
+        """Drain the pipe, normalize levels to 0..1, show or hide the strip."""
+        if self.wave_proc is not None:
+            self._wave_read()                # drain whatever is left in the pipe
+        if self.wave_cnt:                    # partial last bucket
+            self.wave.levels.append(math.sqrt(self.wave_acc / self.wave_cnt))
+        levels = self.wave.levels
+        peak = max(levels) if levels else 0.0
+        if peak > 0:
+            self.wave.set_levels([min(1.0, lv / peak) for lv in levels])
+        else:
+            # no audio stream (ffmpeg exits non-zero when there is nothing to
+            # decode) -> keep the strip visible with a placeholder
+            self.wave.set_levels([], "No audio track")
+        self.wave.setVisible(True)
+        self.wave_proc = None
 
     def toggle_play(self):
         """Play if paused, pause if playing."""
@@ -632,9 +811,19 @@ class Clipper(QWidget):
         new_pos = self.player.position() + delta
         self.player.setPosition(max(0, min(self.player.duration(), new_pos)))
 
+    def _slider_inset(self) -> float:
+        """Half the slider handle width: the groove is inset by this on each
+        side, so the waveform uses the same inset to line up with it."""
+        opt = QStyleOptionSlider()
+        self.slider.initStyleOption(opt)
+        handle = self.slider.style().subControlRect(
+            QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self.slider)
+        return handle.width() / 2
+
     def on_duration(self, dur):
         """Called when the video length becomes known (after loading)."""
         self.slider.setRange(0, dur)   # slider units are milliseconds
+        self.wave.set_timeline(dur, self._slider_inset())
         if self.end_ms == 0:
             self.end_ms = dur          # default selection = whole video
         self.update_range_label()
@@ -644,6 +833,7 @@ class Clipper(QWidget):
         # Don't fight the user: only move the slider if they aren't dragging it.
         if not self.slider.isSliderDown():
             self.slider.setValue(pos)
+        self.wave.set_playhead(pos)
         self.time_lbl.setText(f"{fmt(pos)} / {fmt(self.player.duration())}")
 
         # If we're previewing the selection, stop once we reach the end marker.

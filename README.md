@@ -11,6 +11,9 @@ original file is never modified.
   mkv, webm, avi, m4v, …) and audio (mp3, wav, ogg, flac, m4a, aac, opus, …)
 - Mark start/end points with buttons or keyboard shortcuts; the marked range
   is highlighted on the seek bar
+- Waveform strip under the seek bar shows audio activity over time
+  (green/yellow/red loudness bars; a placeholder is shown if the file has
+  no audio track)
 - Preview just the selected range before exporting
 - Export to **mp4, webm, mkv, mov** (video containers) or **mp3, wav, ogg,
   flac, m4a, opus** (audio)
