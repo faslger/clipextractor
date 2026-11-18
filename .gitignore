@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Video files are inputs/outputs of the app, not source - keep them out of the repo
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.m4v
