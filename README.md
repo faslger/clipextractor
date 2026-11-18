@@ -13,7 +13,9 @@ original file is never modified.
   is highlighted on the seek bar
 - Waveform strip under the seek bar shows audio activity over time
   (green/yellow/red loudness bars; a placeholder is shown if the file has
-  no audio track)
+  no audio track). It is aligned with the seek bar: click/drag to seek,
+  Shift+drag to mark the clip range, and a white stripe shows the playhead
+- **Loop** option repeats the marked range during preview
 - Preview just the selected range before exporting
 - Export to **mp4, webm, mkv, mov** (video containers) or **mp3, wav, ogg,
   flac, m4a, opus** (audio)

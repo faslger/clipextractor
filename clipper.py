@@ -41,7 +41,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QRect, QRectF, Qt, QProcess, QUrl
+from PySide6.QtCore import QRect, QRectF, Qt, QProcess, QUrl, Signal
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QPalette, QPen, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -169,7 +169,13 @@ class WaveformView(QWidget):
     green (quiet), yellow or red (loud). `duration_ms` + `inset` map time to
     pixels exactly like the seek bar's groove, and a white stripe marks the
     current playback position.
+
+    Mouse: click/drag seeks (seekRequested); Shift+click/drag marks the clip
+    range (rangeMarked with start/end in ms).
     """
+
+    seekRequested = Signal(int)      # user clicked/dragged: seek to this time
+    rangeMarked = Signal(int, int)   # user shift-dragged: set start/end (ms)
 
     def __init__(self):
         super().__init__()
@@ -178,6 +184,8 @@ class WaveformView(QWidget):
         self.duration_ms = 0    # total media duration (0 = unknown)
         self.inset = 0.0        # px trimmed each side to match the slider groove
         self.playhead_ms = -1   # current position; < 0 hides the white stripe
+        self._drag_mode = None       # None | "seek" | "mark"
+        self._mark_anchor = 0        # where a Shift+drag started (ms)
         self.setMinimumHeight(40)
         self.setMaximumHeight(60)
 
@@ -201,6 +209,43 @@ class WaveformView(QWidget):
         """Pixel x for a time in ms, using the same mapping as the slider."""
         span = max(1.0, self.width() - 2 * self.inset)
         return self.inset + (ms / self.duration_ms) * span
+
+    def _ms_for(self, x: float) -> int:
+        """Time in ms for a pixel x (inverse of _x_for), clamped to the file."""
+        if self.duration_ms <= 0:
+            return 0
+        span = max(1.0, self.width() - 2 * self.inset)
+        return max(0, min(self.duration_ms,
+                          int((x - self.inset) * self.duration_ms / span)))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.duration_ms > 0:
+            ms = self._ms_for(event.position().x())
+            if event.modifiers() & Qt.ShiftModifier:
+                self._drag_mode = "mark"      # Shift+drag: mark start..end
+                self._mark_anchor = ms
+                self.rangeMarked.emit(ms, ms)
+            else:
+                self._drag_mode = "seek"      # plain click/drag: seek
+                self.seekRequested.emit(ms)
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_mode == "seek":
+            self.seekRequested.emit(self._ms_for(event.position().x()))
+        elif self._drag_mode == "mark":
+            cur = self._ms_for(event.position().x())
+            self.rangeMarked.emit(min(self._mark_anchor, cur),
+                                  max(self._mark_anchor, cur))
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._drag_mode is not None:
+            self._drag_mode = None
+        else:
+            super().mouseReleaseEvent(event)
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -455,8 +500,9 @@ visible inside the band. Clicking the bar jumps straight to that position.</p>
 <p>The strip directly below the seek bar is a waveform of the audio, aligned
 with the seek bar above it: each pixel column is one slice of time, colored
 green (quiet), yellow or red (loud), and a white stripe marks the current
-playback position. Files without an audio track show a "No audio track"
-placeholder instead.</p>
+playback position. <b>Click or drag on it to seek</b>; hold <b>Shift</b> while
+dragging to mark the start/end range directly on the waveform. Files without
+an audio track show a "No audio track" placeholder instead.</p>
 
 <h3>Transport &amp; markers</h3>
 <ul>
@@ -464,7 +510,7 @@ placeholder instead.</p>
 <li><b>Left / Right</b> &mdash; seek 1 s back/forward (<b>Shift</b> = 5 s).</li>
 <li><b>I / O</b> &mdash; set the start/end marker at the playhead.</li>
 <li><b>P</b> / Preview &mdash; plays only the marked range and stops at the
-end marker.</li>
+end marker. Tick <b>Loop</b> next to it to repeat the range until you pause.</li>
 </ul>
 
 <h3>Export row</h3>
@@ -580,7 +626,8 @@ class Clipper(QWidget):
         self.time_lbl = QLabel("00:00:00.000 / 00:00:00.000")
         # Audio-activity strip shown below the seek bar once a file is analyzed.
         self.wave = WaveformView()
-        self.wave.setToolTip("Audio activity over time (green = quiet, red = loud)")
+        self.wave.setToolTip("Audio activity (green = quiet, red = loud). "
+                            "Click/drag to seek; Shift+drag to mark the clip range.")
         self.wave.setVisible(False)
 
         # Buttons; shortcut hints live in tooltips to keep the labels short.
@@ -593,7 +640,9 @@ class Clipper(QWidget):
         self.set_end_btn = QPushButton("Set end")
         self.set_end_btn.setToolTip("Set clip end at the playhead (O)")
         self.preview_btn = QPushButton("Preview")
-        self.preview_btn.setToolTip("Play only the marked range (P)")
+        self.preview_btn.setToolTip("Play only the marked range (P); tick Loop to repeat it")
+        self.loop_check = QCheckBox("Loop")
+        self.loop_check.setToolTip("Repeat the marked range while previewing")
         self.range_lbl = QLabel("Start: --    End: --")
         self.help_btn = QPushButton("Help")
         self.help_btn.setToolTip("Show the user guide (shortcuts, markers, export options)")
@@ -641,6 +690,7 @@ class Clipper(QWidget):
         controls.addWidget(self.set_start_btn)
         controls.addWidget(self.set_end_btn)
         controls.addWidget(self.preview_btn)
+        controls.addWidget(self.loop_check)
         controls.addWidget(self.range_lbl, 1)
         controls.addWidget(self.help_btn)
 
@@ -687,6 +737,10 @@ class Clipper(QWidget):
         # The player tells us when the playhead moves / the file length is known.
         self.player.positionChanged.connect(self.on_position)
         self.player.durationChanged.connect(self.on_duration)
+
+        # Waveform interactions: click/drag seeks, Shift+drag marks the range.
+        self.wave.seekRequested.connect(self.wave_seek)
+        self.wave.rangeMarked.connect(self.wave_mark_range)
 
         # Keyboard shortcuts (key, handler). Lambdas let us pass an argument.
         for key, fn in [
@@ -836,10 +890,14 @@ class Clipper(QWidget):
         self.wave.set_playhead(pos)
         self.time_lbl.setText(f"{fmt(pos)} / {fmt(self.player.duration())}")
 
-        # If we're previewing the selection, stop once we reach the end marker.
+        # If we're previewing the selection, stop at the end marker — or, when
+        # Loop is ticked, jump back to the start and keep playing.
         if self.previewing and pos >= self.end_ms:
-            self.player.pause()
-            self.previewing = False
+            if self.loop_check.isChecked():
+                self.player.setPosition(self.start_ms)
+            else:
+                self.player.pause()
+                self.previewing = False
 
     # ------------------------------------------------------------------
     # Start / end markers
@@ -868,10 +926,21 @@ class Clipper(QWidget):
         self.slider.set_marks(self.start_ms, self.end_ms)
 
     def preview(self):
-        """Play only the selected range (jump to start, auto-stop at end)."""
+        """Play only the selected range (jump to start, stop at end or loop)."""
         self.player.setPosition(self.start_ms)
-        self.previewing = True  # on_position() watches this flag to stop at end_ms
+        self.previewing = True  # on_position() watches this flag at end_ms
         self.player.play()
+
+    def wave_seek(self, ms: int):
+        """Seek to a position clicked/dragged on the waveform."""
+        self.previewing = False  # manual control cancels any running preview
+        self.player.setPosition(ms)
+
+    def wave_mark_range(self, a: int, b: int):
+        """Set the clip range from a Shift+drag on the waveform (ms)."""
+        self.start_ms = a
+        self.end_ms = b if b > a else a + 1  # keep the range non-empty
+        self.update_range_label()
 
     # ------------------------------------------------------------------
     # Export (runs ffmpeg)
