@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Clipper - open a video or audio file, seek around, mark a start/end, and
-export the marked range to many formats (mp4, webm, mkv, mov, mp3, wav,
-ogg, flac, m4a, opus).
+Clipper - open a video or audio file, seek around, mark a start/end (the
+marked range is highlighted on the seek bar), and export it to many
+formats (mp4, webm, mkv, mov, mp3, wav, ogg, flac, m4a, opus).
 
 Requirements:
     pip install PySide6
@@ -30,13 +30,14 @@ import shutil
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QProcess, QUrl
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtCore import QRect, Qt, QProcess, QUrl
+from PySide6.QtGui import QColor, QKeySequence, QPainter, QPalette, QPen, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel,
-    QMessageBox, QPushButton, QSlider, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QSlider, QStyle, QStyleOptionSlider, QVBoxLayout,
+    QWidget,
 )
 
 # Extensions we treat as audio-only inputs: they play sound but have no
@@ -87,6 +88,60 @@ def fmt(ms: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{milli:03d}"
 
 
+class MarkerSlider(QSlider):
+    """Seek bar that also paints the marked [start, end] range on top of it."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.start_ms = 0
+        self.end_ms = 0
+
+    def set_marks(self, start_ms: int, end_ms: int):
+        """Store the marker positions (milliseconds) and repaint."""
+        self.start_ms = start_ms
+        self.end_ms = end_ms
+        self.update()
+
+    def _x_for(self, ms: int) -> int:
+        """Pixel x where the handle center would sit if the value were `ms`."""
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        opt.sliderPosition = max(self.minimum(), min(self.maximum(), ms))
+        opt.sliderValue = opt.sliderPosition
+        handle = self.style().subControlRect(
+            QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
+        return handle.center().x()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)  # draw the normal slider first
+        dur = self.maximum()
+        if dur <= 0 or self.end_ms <= self.start_ms:
+            return  # nothing marked yet
+        x1 = self._x_for(self.start_ms)
+        x2 = self._x_for(min(dur, self.end_ms))
+
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        groove = self.style().subControlRect(
+            QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self)
+        cy = groove.center().y()
+
+        highlight = self.palette().color(QPalette.Highlight)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        # Translucent band across the groove over the selected range
+        # (the playhead handle stays visible through it).
+        band = QColor(highlight)
+        band.setAlpha(90)
+        p.fillRect(QRect(x1, cy - 3, max(1, x2 - x1), 6), band)
+        # Solid marker lines at start and end, spanning the bar's height.
+        p.setPen(QPen(highlight, 2))
+        r = self.rect()
+        p.drawLine(x1, r.top() + 1, x1, r.bottom() - 1)
+        p.drawLine(x2, r.top() + 1, x2, r.bottom() - 1)
+        p.end()
+
+
 class Clipper(QWidget):
     """The main (and only) window of the app."""
 
@@ -115,7 +170,7 @@ class Clipper(QWidget):
         # Transport row: open file, play/pause, current time display
         self.open_btn = QPushButton("Open media…")
         self.play_btn = QPushButton("Play / Pause")
-        self.slider = QSlider(Qt.Horizontal)   # the seek bar
+        self.slider = MarkerSlider(Qt.Horizontal)   # the seek bar (shows the marks)
         self.slider.setRange(0, 0)             # real range is set once duration is known
         self.time_lbl = QLabel("00:00:00.000 / 00:00:00.000")
 
@@ -221,6 +276,7 @@ class Clipper(QWidget):
         self.player.setSource(QUrl.fromLocalFile(str(path.resolve())))
         self.start_ms = 0
         self.end_ms = 0  # will be filled in by on_duration once Qt knows the length
+        self.slider.set_marks(0, 0)  # clear any old marks on the seek bar
         self.player.pause()  # show the first frame without auto-playing
         # Audio-only files have no frames to show, so hide the video pane.
         is_audio = path.suffix.lower() in AUDIO_EXTS
@@ -281,10 +337,11 @@ class Clipper(QWidget):
         self.update_range_label()
 
     def update_range_label(self):
-        """Refresh the 'Start / End / length' text under the video."""
+        """Refresh the 'Start / End / length' text and the marks on the seek bar."""
         self.range_lbl.setText(
             f"Start: {fmt(self.start_ms)}    End: {fmt(self.end_ms)}    "
             f"({(self.end_ms - self.start_ms) / 1000:.2f}s)")
+        self.slider.set_marks(self.start_ms, self.end_ms)
 
     def preview(self):
         """Play only the selected range (jump to start, auto-stop at end)."""
