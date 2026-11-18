@@ -35,9 +35,9 @@ from PySide6.QtGui import QColor, QKeySequence, QPainter, QPalette, QPen, QShort
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel,
-    QMessageBox, QPushButton, QSlider, QStyle, QStyleOptionSlider, QVBoxLayout,
-    QWidget,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
+    QLabel, QMessageBox, QPushButton, QSlider, QStyle, QStyleOptionSlider,
+    QVBoxLayout, QWidget,
 )
 
 # Extensions we treat as audio-only inputs: they play sound but have no
@@ -167,53 +167,67 @@ class Clipper(QWidget):
         self.player.setVideoOutput(self.video)
 
         # ---------- widgets ----------
-        # Transport row: open file, play/pause, current time display
-        self.open_btn = QPushButton("Open media…")
-        self.play_btn = QPushButton("Play / Pause")
-        self.slider = MarkerSlider(Qt.Horizontal)   # the seek bar (shows the marks)
+        # Seek bar (paints the marked range) with the time readout beside it.
+        self.slider = MarkerSlider(Qt.Horizontal)
         self.slider.setRange(0, 0)             # real range is set once duration is known
         self.time_lbl = QLabel("00:00:00.000 / 00:00:00.000")
 
-        # Marker row: choose which part of the video becomes the clip
-        self.set_start_btn = QPushButton("Set start [I]")
-        self.set_end_btn = QPushButton("Set end [O]")
-        self.preview_btn = QPushButton("Preview [P]")
+        # Buttons; shortcut hints live in tooltips to keep the labels short.
+        self.open_btn = QPushButton("Open…")
+        self.open_btn.setToolTip("Open a video or audio file")
+        self.play_btn = QPushButton("Play / Pause")
+        self.play_btn.setToolTip("Play / pause (Space)")
+        self.set_start_btn = QPushButton("Set start")
+        self.set_start_btn.setToolTip("Set clip start at the playhead (I)")
+        self.set_end_btn = QPushButton("Set end")
+        self.set_end_btn.setToolTip("Set clip end at the playhead (O)")
+        self.preview_btn = QPushButton("Preview")
+        self.preview_btn.setToolTip("Play only the marked range (P)")
         self.range_lbl = QLabel("Start: --    End: --")
 
-        # Export row: output format, fast-copy option, export button
+        # Export controls: output format, fast-copy option, export button
         self.format_box = QComboBox()
         self.format_box.addItems(list(EXPORT_FORMATS))
-        self.fast_check = QCheckBox("Fast copy (no re-encode, cuts on keyframes)")
+        self.fast_check = QCheckBox("Fast copy")
         self.fast_check.setToolTip(
-            "Copy the streams as-is instead of re-encoding. Only works when the "
+            "Copy the streams as-is instead of re-encoding: very fast, but cuts "
+            "on keyframes so the start may be slightly off. Only works when the "
             "source codecs are compatible with the chosen output container.")
-        self.export_btn = QPushButton("Export clip…")
+        self.export_btn = QPushButton("Export…")
+        self.export_btn.setToolTip("Export the marked range with ffmpeg")
         self.status = QLabel("Open a video or audio file to begin.")
 
         # ---------- layout ----------
-        # Each row is a horizontal layout; they're stacked in a vertical one.
-        top = QHBoxLayout()
-        top.addWidget(self.open_btn)
-        top.addWidget(self.play_btn)
-        top.addWidget(self.time_lbl, 1, Qt.AlignRight)
+        # Row 1: seek bar with the time readout at its right end.
+        seek = QHBoxLayout()
+        seek.addWidget(self.slider, 1)   # stretch=1: slider takes the spare space
+        seek.addWidget(self.time_lbl)
 
-        marks = QHBoxLayout()
-        marks.addWidget(self.set_start_btn)
-        marks.addWidget(self.set_end_btn)
-        marks.addWidget(self.preview_btn)
-        marks.addWidget(self.range_lbl, 1)
+        # Row 2: transport buttons, a separator, then the clip-range buttons;
+        # the start/end readout fills the remaining space on the right.
+        controls = QHBoxLayout()
+        controls.addWidget(self.open_btn)
+        controls.addWidget(self.play_btn)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        controls.addWidget(sep)
+        controls.addWidget(self.set_start_btn)
+        controls.addWidget(self.set_end_btn)
+        controls.addWidget(self.preview_btn)
+        controls.addWidget(self.range_lbl, 1)
 
+        # Row 3: export options on the left, the export button on the right.
         export = QHBoxLayout()
         export.addWidget(QLabel("Format:"))
         export.addWidget(self.format_box)
-        export.addWidget(self.fast_check, 1)
+        export.addWidget(self.fast_check)
+        export.addStretch(1)
         export.addWidget(self.export_btn)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.video, 1)   # stretch=1: video takes all spare space
-        layout.addWidget(self.slider)
-        layout.addLayout(top)
-        layout.addLayout(marks)
+        layout.addLayout(seek)
+        layout.addLayout(controls)
         layout.addLayout(export)
         layout.addWidget(self.status)
 
