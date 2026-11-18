@@ -11,11 +11,20 @@ original file is never modified.
   mkv, webm, avi, m4v, …) and audio (mp3, wav, ogg, flac, m4a, aac, opus, …)
 - Mark start/end points with buttons or keyboard shortcuts; the marked range
   is highlighted on the seek bar
-- Waveform strip under the seek bar shows audio activity over time
-  (green/yellow/red loudness bars; a placeholder is shown if the file has
-  no audio track). It is aligned with the seek bar: click/drag to seek,
-  Shift+drag to mark the clip range, and a white stripe shows the playhead
+- Waveform strip under the seek bar shows audio loudness over time on an
+  absolute dB scale (green = quiet < −36 dB, yellow = medium, red = loud
+  > −15 dB relative to full scale, so quiet parts of loud files still show
+  green; a placeholder is shown if the file has no audio track). It is
+  aligned with the seek bar: click/drag to seek, Shift+drag to mark the clip
+  range, and a white stripe shows the playhead
 - **Loop** option repeats the marked range during preview
+- **Clip list**: press `A` (Add clip) to queue the marked range, repeat for
+  every range you want — all queued clips are painted on the seek bar and the
+  waveform. Clips are nameable (`clip01`, `clip02`, … by default; `F2` or
+  **Rename** to change the name), and the name becomes part of the exported
+  filename. Export writes one file per clip (`name_clip01.ext`,
+  `name_intro.ext`, …) through a sequential queue, or tick **Join** to merge
+  all clips into a single file
 - Preview just the selected range before exporting
 - Export to **mp4, webm, mkv, mov** (video containers) or **mp3, wav, ogg,
   flac, m4a, opus** (audio)
@@ -65,6 +74,13 @@ python clipper.py myvideo.mp4  # or open a file directly
 4. Press **Preview** (or `P`) to check the selection.
 5. Choose a format, then click **Export…** and pick where to save it.
 
+To cut several ranges in one go: after marking each range, press **Add clip**
+(or `A`) to add it to the clip list on the right (the name editor opens so you
+can name the clip; `F2` renames later), then **Export…** once — each clip is
+saved as `name_clip01.ext`, `name_<yourname>.ext`, … (or as one merged file
+when **Join** is ticked). Double-click a list entry to load it back into the
+markers.
+
 If you never set a marker, the start defaults to the beginning and the end to
 the end of the file.
 
@@ -75,6 +91,7 @@ the end of the file.
 | `Space`            | Play / pause                        |
 | `I`                | Set start marker at current position |
 | `O`                | Set end marker at current position  |
+| `A`                | Add the marked range to the clip list |
 | `P`                | Preview the selected range          |
 | `←` / `→`          | Seek back / forward 1 second        |
 | `Shift` + `←` / `→`| Seek back / forward 5 seconds       |
@@ -86,8 +103,9 @@ the end of the file.
 | **Format**     | Output format: mp4, webm, mkv, mov, mp3, wav, ogg, flac, m4a, opus. The extension is appended automatically. |
 | **Audio only** | Drops the video stream (`-vn`) even for video containers. Disabled for audio formats. |
 | **Fast copy**  | Stream copy without re-encoding: instant, but cuts on keyframes (start can be off) and needs source codecs that fit the container. Disabled for mp3. |
+| **Join**       | With 2+ clips in the clip list, merge them into one output file (concat filter) instead of one file per clip. Always re-encodes. Enabled once 2+ clips are queued. |
 | **Options…**   | Popup with extra ffmpeg settings (see below). Settings persist between openings. |
-| **Export…**    | Asks for a filename and runs ffmpeg in the background. |
+| **Export…**    | Asks for a filename and runs ffmpeg in the background. With clips in the list, one job per clip runs sequentially and the status line shows `Exporting clip k/N`. |
 
 ## Export options (the "Options…" popup)
 
@@ -147,7 +165,7 @@ arguments used when re-encoding, so adding a format is a one-line change.
 
 ## Ideas for extending
 
-- Export several clips from one session (a queue)
-- A waveform or thumbnail strip under the seek bar
+- A thumbnail strip under the seek bar (frame snapshots instead of the waveform)
 - Fine-grained start/end time entry (type a timestamp)
 - Animated GIF output
+- Loudness normalization before export

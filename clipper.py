@@ -3,6 +3,8 @@
 Clipper - open a video or audio file, seek around, mark a start/end (the
 marked range is highlighted on the seek bar), and export it to many
 formats (mp4, webm, mkv, mov, mp3, wav, ogg, flac, m4a, opus).
+Marked ranges can be collected into a clip list and exported all at once:
+one file per clip, or all joined into a single file ("Join").
 The "Options…" button opens a popup with extra ffmpeg settings
 (frame rate, resolution, aspect ratio, scaling, quality, bitrates,
 speed, raw arguments).
@@ -17,6 +19,7 @@ Run:
 Shortcuts:
     Space       play / pause
     I / O       set start / end marker at current position
+    A           add the marked range to the clip list
     Left/Right  seek -1s / +1s   (hold Shift for 5s)
     P           preview the selected range
 
@@ -46,10 +49,11 @@ from PySide6.QtGui import QColor, QKeySequence, QPainter, QPalette, QPen, QShort
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
-    QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QSlider, QStyle, QStyleOptionSlider, QTextBrowser,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
+    QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox,
+    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSlider, QStyle,
+    QStyleOptionSlider, QTextBrowser, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QWidget,
 )
 
 # Extensions we treat as audio-only inputs: they play sound but have no
@@ -89,9 +93,13 @@ OPEN_FILTER = (
 # Waveform analysis: the audio is decoded to mono PCM at WAVE_RATE Hz and
 # bucketed into RMS levels every WAVE_BUCKET_MS milliseconds. Painting
 # aggregates the buckets down to one bar per pixel column, so the strip is
-# as high-resolution as the window is wide.
+# as high-resolution as the window is wide. Levels are shown on an absolute
+# scale: dB relative to full scale, mapped onto 0..1 over a fixed -60..0 dB
+# window (so green/yellow/red keep their meaning in every file, instead of
+# rescaling each file to its own peak).
 WAVE_RATE = 8000
 WAVE_BUCKET_MS = 10
+WAVE_FLOOR_DB = -60.0
 
 
 def fmt(ms: int) -> str:
@@ -107,18 +115,33 @@ def fmt(ms: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{milli:03d}"
 
 
+def safe_name(text: str) -> str:
+    """Turn a clip name into a safe filename part (no path separators or
+    characters the filesystem may reject, capped in length)."""
+    cleaned = "".join(c for c in text.strip()
+                      if c not in '/\\:*?"<>|').strip().strip(".")
+    return cleaned[:60]
+
+
 class MarkerSlider(QSlider):
-    """Seek bar that also paints the marked [start, end] range on top of it."""
+    """Seek bar that paints the queued clip ranges and the marked [start, end]
+    range on top of it (the marked range gets the stronger highlight)."""
 
     def __init__(self, *args):
         super().__init__(*args)
         self.start_ms = 0
         self.end_ms = 0
+        self.ranges: list[tuple[int, int]] = []  # queued clips (ms)
 
     def set_marks(self, start_ms: int, end_ms: int):
         """Store the marker positions (milliseconds) and repaint."""
         self.start_ms = start_ms
         self.end_ms = end_ms
+        self.update()
+
+    def set_ranges(self, ranges: list[tuple[int, int]]):
+        """Store the queued clip ranges (milliseconds) and repaint."""
+        self.ranges = list(ranges)
         self.update()
 
     def _x_for(self, ms: int) -> int:
@@ -134,11 +157,8 @@ class MarkerSlider(QSlider):
     def paintEvent(self, event):
         super().paintEvent(event)  # draw the normal slider first
         dur = self.maximum()
-        if dur <= 0 or self.end_ms <= self.start_ms:
-            return  # nothing marked yet
-        x1 = self._x_for(self.start_ms)
-        x2 = self._x_for(min(dur, self.end_ms))
-
+        if dur <= 0:
+            return
         opt = QStyleOptionSlider()
         self.initStyleOption(opt)
         groove = self.style().subControlRect(
@@ -148,27 +168,41 @@ class MarkerSlider(QSlider):
         highlight = self.palette().color(QPalette.Highlight)
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        # Translucent band across the groove over the selected range
-        # (the playhead handle stays visible through it).
-        band = QColor(highlight)
-        band.setAlpha(90)
-        p.fillRect(QRect(x1, cy - 3, max(1, x2 - x1), 6), band)
-        # Solid marker lines at start and end, spanning the bar's height.
-        p.setPen(QPen(highlight, 2))
-        r = self.rect()
-        p.drawLine(x1, r.top() + 1, x1, r.bottom() - 1)
-        p.drawLine(x2, r.top() + 1, x2, r.bottom() - 1)
+        # Queued clips: soft translucent bands across the groove.
+        for s, e in self.ranges:
+            if e <= s:
+                continue
+            x1 = self._x_for(s)
+            x2 = self._x_for(min(dur, e))
+            band = QColor(highlight)
+            band.setAlpha(45)
+            p.fillRect(QRect(x1, cy - 3, max(1, x2 - x1), 6), band)
+        # Marked range: stronger band across the groove (the playhead handle
+        # stays visible through it) plus solid marker lines at start and end.
+        if self.end_ms > self.start_ms:
+            x1 = self._x_for(self.start_ms)
+            x2 = self._x_for(min(dur, self.end_ms))
+            band = QColor(highlight)
+            band.setAlpha(90)
+            p.fillRect(QRect(x1, cy - 3, max(1, x2 - x1), 6), band)
+            p.setPen(QPen(highlight, 2))
+            r = self.rect()
+            p.drawLine(x1, r.top() + 1, x1, r.bottom() - 1)
+            p.drawLine(x2, r.top() + 1, x2, r.bottom() - 1)
         p.end()
 
 
 class WaveformView(QWidget):
     """Strip below the seek bar showing audio activity over time.
 
-    `levels` holds one RMS level (0..1) per WAVE_BUCKET_MS bucket; painting
+    `levels` holds one loudness level (0..1) per WAVE_BUCKET_MS bucket, on an
+    absolute dBFS scale (0 = WAVE_FLOOR_DB, 1 = full scale); painting
     aggregates buckets into one bottom-anchored bar per pixel column, colored
     green (quiet), yellow or red (loud). `duration_ms` + `inset` map time to
     pixels exactly like the seek bar's groove, and a white stripe marks the
     current playback position.
+
+    Queued clip ranges (`ranges`) are painted as soft background bands.
 
     Mouse: click/drag seeks (seekRequested); Shift+click/drag marks the clip
     range (rangeMarked with start/end in ms).
@@ -184,6 +218,7 @@ class WaveformView(QWidget):
         self.duration_ms = 0    # total media duration (0 = unknown)
         self.inset = 0.0        # px trimmed each side to match the slider groove
         self.playhead_ms = -1   # current position; < 0 hides the white stripe
+        self.ranges: list[tuple[int, int]] = []  # queued clips (ms)
         self._drag_mode = None       # None | "seek" | "mark"
         self._mark_anchor = 0        # where a Shift+drag started (ms)
         self.setMinimumHeight(40)
@@ -203,6 +238,11 @@ class WaveformView(QWidget):
     def set_playhead(self, ms: int):
         """Move the white position stripe (ms); negative hides it."""
         self.playhead_ms = ms
+        self.update()
+
+    def set_ranges(self, ranges: list[tuple[int, int]]):
+        """Store the queued clip ranges (ms) to paint as background bands."""
+        self.ranges = list(ranges)
         self.update()
 
     def _x_for(self, ms: float) -> float:
@@ -251,6 +291,16 @@ class WaveformView(QWidget):
         p = QPainter(self)
         p.fillRect(self.rect(), self.palette().color(QPalette.Window))
         w, h = self.width(), self.height()
+        # Queued clip ranges: soft background bands behind the bars.
+        if self.ranges and self.duration_ms > 0:
+            band = QColor(self.palette().color(QPalette.Highlight))
+            band.setAlpha(40)
+            for s, e in self.ranges:
+                if e <= s:
+                    continue
+                x1 = self._x_for(s)
+                x2 = self._x_for(min(self.duration_ms, e))
+                p.fillRect(QRectF(x1, 0, max(1.0, x2 - x1), h), band)
         n = len(self.levels)
         if n and self.duration_ms > 0:
             # one bar per pixel column across the groove area; each column
@@ -266,11 +316,11 @@ class WaveformView(QWidget):
                 lv = max(self.levels[i0:i1])
                 bh = max(1.0, lv * (h - 4))
                 if lv < 0.4:
-                    c = QColor(76, 175, 80)    # green: quiet
+                    c = QColor(76, 175, 80)    # green: quiet (< -36 dBFS)
                 elif lv < 0.75:
-                    c = QColor(255, 193, 7)    # yellow: medium
+                    c = QColor(255, 193, 7)    # yellow: medium (< -15 dBFS)
                 else:
-                    c = QColor(244, 67, 54)    # red: loud
+                    c = QColor(244, 67, 54)    # red: loud (> -15 dBFS)
                 p.fillRect(QRectF(cx, h - bh, 1.0, bh), c)
         elif n:
             # duration not known yet: plain full-width bars
@@ -411,50 +461,51 @@ class ExportOptionsDialog(QDialog):
             return self.speed_slider.value() / 100.0
         return None
 
-    def ffmpeg_args(self, ext: str, video: bool) -> list[str]:
-        """Build the extra ffmpeg arguments from the current widget states.
+    def video_filters(self) -> list[str]:
+        """The video filter chain (scale / pad) from the current widgets.
 
-        `video` is False for audio-only exports, so video filters are skipped.
+        The speed option's setpts is deliberately not included here; callers
+        add it themselves so Join mode can apply it after the concat instead.
         """
+        vf: list[str] = []
+        scale = self.res_box.currentData()
+        if scale:
+            # a fixed resolution wins over the scale slider
+            w, h = scale.split("x")
+            vf.append(f"scale={w}:{h}")
+        elif self.scale_chk.isChecked():
+            f = self.scale_slider.value() / 100.0
+            # keep width/height even (required by many codecs)
+            vf.append(f"scale=trunc(iw*{f:.3f}/2)*2:trunc(ih*{f:.3f}/2)*2")
+        ar = self.aspect_box.currentData()
+        if ar and not scale:
+            # Letterbox into the chosen aspect ratio with pad alone: the
+            # canvas grows to the ratio (black bars), the content is never
+            # cropped or resized. max() keeps the canvas >= the input, since
+            # pad cannot shrink. Ignored when a fixed resolution is set
+            # (it already defines the canvas).
+            a, b = ar.split(":")
+            # commas inside max() must be escaped for the filtergraph parser
+            vf.append(f"pad=max(iw\\,trunc(ih*{a}/{b}/2)*2):"
+                      f"max(ih\\,trunc(iw*{b}/{a}/2)*2):(ow-iw)/2:(oh-ih)/2")
+        return vf
+
+    def _video_flags(self) -> list[str]:
+        """Plain output flags for video: -r, -crf, -b:v."""
         args: list[str] = []
-        vf: list[str] = []  # video filters, merged into a single -vf
-        if video:
-            if self.fps_chk.isChecked():
-                args += ["-r", str(self.fps_slider.value())]
-            scale = self.res_box.currentData()
-            if scale:
-                # a fixed resolution wins over the scale slider
-                w, h = scale.split("x")
-                vf.append(f"scale={w}:{h}")
-            elif self.scale_chk.isChecked():
-                f = self.scale_slider.value() / 100.0
-                # keep width/height even (required by many codecs)
-                vf.append(f"scale=trunc(iw*{f:.3f}/2)*2:trunc(ih*{f:.3f}/2)*2")
-            ar = self.aspect_box.currentData()
-            if ar and not scale:
-                # Letterbox into the chosen aspect ratio with pad alone: the
-                # canvas grows to the ratio (black bars), the content is never
-                # cropped or resized. max() keeps the canvas >= the input, since
-                # pad cannot shrink. Ignored when a fixed resolution is set
-                # (it already defines the canvas).
-                a, b = ar.split(":")
-                # commas inside max() must be escaped for the filtergraph parser
-                vf.append(f"pad=max(iw\\,trunc(ih*{a}/{b}/2)*2):"
-                          f"max(ih\\,trunc(iw*{b}/{a}/2)*2):(ow-iw)/2:(oh-ih)/2")
-            if self.crf_chk.isChecked():
-                args += ["-crf", str(self.crf_slider.value())]
-            vbr = self.vbr_box.currentData()
-            if vbr:
-                args += ["-b:v", vbr]
-        if self.speed_chk.isChecked():
-            k = self.speed_slider.value() / 100.0
-            args += ["-af", f"atempo={k:.3f}"]   # audio tempo
-            if video:
-                vf.append(f"setpts=PTS/{k:.3f}")  # video timestamps
-        if vf:
-            args += ["-vf", ",".join(vf)]
-        # Audio options (every export keeps its audio stream); a bitrate makes
-        # no sense for lossless PCM/FLAC, so skip it there.
+        if self.fps_chk.isChecked():
+            args += ["-r", str(self.fps_slider.value())]
+        if self.crf_chk.isChecked():
+            args += ["-crf", str(self.crf_slider.value())]
+        vbr = self.vbr_box.currentData()
+        if vbr:
+            args += ["-b:v", vbr]
+        return args
+
+    def _audio_flags(self, ext: str) -> list[str]:
+        """Plain output flags for audio plus raw extra args (-b:a, -ar, -ac)."""
+        args: list[str] = []
+        # A bitrate makes no sense for lossless PCM/FLAC, so skip it there.
         abr = self.abr_box.currentData()
         if abr and ext not in ("wav", "flac"):
             args += ["-b:a", abr]
@@ -467,6 +518,33 @@ class ExportOptionsDialog(QDialog):
         raw = self.extra_edit.text().strip()
         if raw:
             args += shlex.split(raw)
+        return args
+
+    def ffmpeg_args(self, ext: str, video: bool) -> list[str]:
+        """Build the extra ffmpeg arguments from the current widget states.
+
+        `video` is False for audio-only exports, so video filters are skipped.
+        """
+        args: list[str] = self._video_flags() if video else []
+        vf: list[str] = self.video_filters() if video else []
+        if self.speed_chk.isChecked():
+            k = self.speed_slider.value() / 100.0
+            args += ["-af", f"atempo={k:.3f}"]   # audio tempo
+            if video:
+                vf.append(f"setpts=PTS/{k:.3f}")  # video timestamps
+        if vf:
+            args += ["-vf", ",".join(vf)]
+        args += self._audio_flags(ext)
+        return args
+
+    def ffmpeg_output_args(self, ext: str, video: bool) -> list[str]:
+        """Extra arguments without any filtergraph flags (no -vf / -af).
+
+        Used by Join mode, where the filters are folded into the single
+        filter_complex (concat + post-processing) instead.
+        """
+        args: list[str] = self._video_flags() if video else []
+        args += self._audio_flags(ext)
         return args
 
 
@@ -499,8 +577,10 @@ marked start/end range. Dragging the bar seeks; the playhead handle stays
 visible inside the band. Clicking the bar jumps straight to that position.</p>
 <p>The strip directly below the seek bar is a waveform of the audio, aligned
 with the seek bar above it: each pixel column is one slice of time, colored
-green (quiet), yellow or red (loud), and a white stripe marks the current
-playback position. <b>Click or drag on it to seek</b>; hold <b>Shift</b> while
+by absolute loudness — green (quiet, below about -36 dB), yellow (medium) or
+red (loud, above about -15 dB, relative to full scale) — and a white stripe
+marks the current playback position. <b>Click or drag on it to seek</b>; hold
+<b>Shift</b> while
 dragging to mark the start/end range directly on the waveform. Files without
 an audio track show a "No audio track" placeholder instead.</p>
 
@@ -511,7 +591,23 @@ an audio track show a "No audio track" placeholder instead.</p>
 <li><b>I / O</b> &mdash; set the start/end marker at the playhead.</li>
 <li><b>P</b> / Preview &mdash; plays only the marked range and stops at the
 end marker. Tick <b>Loop</b> next to it to repeat the range until you pause.</li>
+<li><b>A</b> / Add clip &mdash; add the marked range to the clip list.</li>
 </ul>
+
+<h3>Clip list (export several clips at once)</h3>
+<p>Press <b>A</b> (or "Add clip") to commit the marked range to the clip list
+shown on the right, and repeat for every range you want — the new clip's name
+editor opens immediately so you can name it. Each clip gets a default name
+(<code>clip01</code>, <code>clip02</code>, …); press <b>F2</b> or the
+<b>Rename</b> button to change a name (the name is sanitized and used in the
+exported filename). All queued clips are painted on the seek bar and the
+waveform (softer bands than the current marks). Double-click a list entry to
+load it back into the markers; use <b>Remove</b> / <b>Clear</b> to edit the
+list. When the list is non-empty, <b>Export…</b> writes one file per clip
+(<code>name_clip01.ext</code>, <code>name_myname.ext</code>, …) and runs them
+one after another — or, with <b>Join</b> ticked, merges all clips into a
+single file (always re-encoded, so the cuts stay exact). With an empty list,
+Export… uses the marked range as before.</p>
 
 <h3>Export row</h3>
 <ul>
@@ -523,11 +619,15 @@ audio-only.</li>
 <li><b>Fast copy</b> &mdash; copies the streams without re-encoding: very
 fast, but cuts on keyframes so the start may be slightly off, and the source
 codecs must be compatible with the chosen container.</li>
+<li><b>Join</b> &mdash; with 2 or more clips in the list, merge them into one
+output file (concat) instead of one file per clip. Always re-encodes, so
+Fast copy is ignored in this mode.</li>
 <li><b>Options…</b> &mdash; popup with extra ffmpeg settings (frame rate,
 resolution, aspect ratio, scaling, quality, bitrates, speed, raw arguments).
 It has its own "?" help button explaining each option.</li>
 <li><b>Export…</b> &mdash; asks for a filename and runs ffmpeg in the
-background; the status line shows progress and the saved path.</li>
+background; with clips in the list, one job per clip runs sequentially. The
+status line shows progress and the saved path.</li>
 </ul>
 
 <h3>Notes</h3>
@@ -597,14 +697,20 @@ class Clipper(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Clipper")
-        self.resize(900, 650)
+        self.resize(1150, 650)
 
         # ---------- state ----------
         self.path: Path | None = None   # currently loaded media file
         self.start_ms = 0               # clip start marker
         self.end_ms = 0                 # clip end marker (0 = not set yet)
+        self.clips: list[tuple[str, int, int]] = []  # queued clips: (name, start, end) in ms
+        self._clip_seq = 0                  # counter for default clip names
+        self._clip_refresh = False          # True while the list widget is rebuilt
         self.previewing = False         # True while "Preview" is playing the range
         self.proc: QProcess | None = None  # the running ffmpeg export, if any
+        self.queue: list[tuple[str, list[str]]] = []  # pending (out, args) jobs
+        self.job_total = 0              # number of jobs in the current export run
+        self._last_out = ""             # last saved file (for the status line)
         self.wave_proc: QProcess | None = None  # ffmpeg analysis for the waveform
         self.wave_buf = bytearray()     # leftover bytes of the pcm stream
         self.wave_acc = 0.0             # sum of squares in the current bucket
@@ -626,7 +732,8 @@ class Clipper(QWidget):
         self.time_lbl = QLabel("00:00:00.000 / 00:00:00.000")
         # Audio-activity strip shown below the seek bar once a file is analyzed.
         self.wave = WaveformView()
-        self.wave.setToolTip("Audio activity (green = quiet, red = loud). "
+        self.wave.setToolTip("Audio loudness on an absolute scale: green = quiet "
+                            "(< -36 dB), yellow = medium, red = loud (> -15 dB). "
                             "Click/drag to seek; Shift+drag to mark the clip range.")
         self.wave.setVisible(False)
 
@@ -659,15 +766,47 @@ class Clipper(QWidget):
             "Copy the streams as-is instead of re-encoding: very fast, but cuts "
             "on keyframes so the start may be slightly off. Only works when the "
             "source codecs are compatible with the chosen output container.")
+        self.join_check = QCheckBox("Join")
+        self.join_check.setToolTip(
+            "With 2+ clips in the clip list, merge them into a single output file "
+            "instead of one file per clip (always re-encoded, so cuts stay exact)")
+        self.join_check.setEnabled(False)  # enabled once 2+ clips are queued
         self.opts_btn = QPushButton("Options…")
         self.opts_btn.setToolTip(
             "Extra ffmpeg options for the export: frame rate, resolution, "
             "aspect ratio, scaling, quality, bitrates, speed, raw arguments…")
         self.export_btn = QPushButton("Export…")
-        self.export_btn.setToolTip("Export the marked range with ffmpeg")
+        self.export_btn.setToolTip(
+            "Export the marked range (or every clip in the list) with ffmpeg")
         self.status = QLabel("Open a video or audio file to begin.")
         # Kept as a member so the popup remembers its settings between openings.
         self.opts_dlg = ExportOptionsDialog(self)
+
+        # Clip-list panel: ranges committed with "Add clip" for multi-clip export.
+        # Column 0 is the editable name (used in the exported filename),
+        # column 1 shows the range.
+        self.clip_total = QLabel("0 clips, 0.00s total")
+        self.clip_list = QTreeWidget()
+        self.clip_list.setHeaderLabels(["Name", "Range"])
+        self.clip_list.setRootIsDecorated(False)
+        self.clip_list.setColumnWidth(0, 120)
+        self.clip_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.clip_list.setEditTriggers(
+            QAbstractItemView.EditTrigger.EditKeyPressed)  # F2 renames
+        self.clip_list.setToolTip(
+            "Double-click a clip to load it back into the markers; "
+            "F2 (or Rename) to change its name — the name is used in the "
+            "exported filename")
+        self.add_clip_btn = QPushButton("Add clip")
+        self.add_clip_btn.setToolTip("Add the marked range to the clip list (A); "
+                                     "its name editor opens so you can name it now")
+        self.rename_clip_btn = QPushButton("Rename")
+        self.rename_clip_btn.setToolTip("Rename the selected clip (F2); the name "
+                                        "becomes part of the exported filename")
+        self.rm_clip_btn = QPushButton("Remove")
+        self.rm_clip_btn.setToolTip("Remove the selected clip(s) from the list")
+        self.clear_clip_btn = QPushButton("Clear")
+        self.clear_clip_btn.setToolTip("Remove all clips from the list")
 
         # ---------- layout ----------
         # Seek bar and waveform share a 2-column grid, so the waveform lines
@@ -700,16 +839,36 @@ class Clipper(QWidget):
         export.addWidget(self.format_box)
         export.addWidget(self.audio_only_check)
         export.addWidget(self.fast_check)
+        export.addWidget(self.join_check)
         export.addWidget(self.opts_btn)
         export.addStretch(1)
         export.addWidget(self.export_btn)
 
-        layout = QVBoxLayout(self)
+        layout = QVBoxLayout()
         layout.addWidget(self.video, 1)   # stretch=1: video takes all spare space
         layout.addLayout(seek)
         layout.addLayout(controls)
         layout.addLayout(export)
         layout.addWidget(self.status)
+
+        # Right-hand panel holding the clip list for multi-clip export.
+        clips_box = QGroupBox("Clips")
+        clips_box.setMaximumWidth(300)
+        clips_layout = QVBoxLayout(clips_box)
+        clips_layout.addWidget(self.clip_total)
+        clips_layout.addWidget(self.clip_list, 1)
+        clip_btns = QHBoxLayout()
+        clip_btns.addWidget(self.add_clip_btn, 1)
+        clip_btns2 = QHBoxLayout()
+        clip_btns2.addWidget(self.rename_clip_btn)
+        clip_btns2.addWidget(self.rm_clip_btn)
+        clip_btns2.addWidget(self.clear_clip_btn)
+        clips_layout.addLayout(clip_btns)
+        clips_layout.addLayout(clip_btns2)
+
+        main = QHBoxLayout(self)
+        main.addLayout(layout, 1)
+        main.addWidget(clips_box)
 
         # ---------- signal/slot wiring ----------
         # Qt "signals" fire on events (a click, a position change...);
@@ -722,11 +881,18 @@ class Clipper(QWidget):
         self.opts_btn.clicked.connect(self.open_options)
         self.export_btn.clicked.connect(self.export)
         self.help_btn.clicked.connect(self.open_help)
+        self.add_clip_btn.clicked.connect(self.add_clip)
+        self.rename_clip_btn.clicked.connect(self.rename_clip)
+        self.rm_clip_btn.clicked.connect(self.remove_clips)
+        self.clear_clip_btn.clicked.connect(self.clear_clips)
+        self.clip_list.itemDoubleClicked.connect(self.load_clip)
+        self.clip_list.itemChanged.connect(self._clip_item_changed)
 
         # Fast copy is only offered for formats that allow stream copy; the
         # "Audio only" box is redundant for formats that already drop video.
         self.format_box.currentTextChanged.connect(self.update_export_options)
         self.update_export_options(self.format_box.currentText())
+        self.refresh_clips()  # initial clip-list label / Join checkbox state
 
         # Dragging the slider seeks the player. Clicking on the bar also
         # jumps there (sliderPressed), not just dragging.
@@ -747,6 +913,7 @@ class Clipper(QWidget):
             ("Space", self.toggle_play),
             ("I", self.set_start),
             ("O", self.set_end),
+            ("A", self.add_clip),
             ("P", self.preview),
             ("Left", lambda: self.nudge(-1000)),        # back 1 second
             ("Right", lambda: self.nudge(1000)),        # forward 1 second
@@ -776,6 +943,9 @@ class Clipper(QWidget):
         self.player.setSource(QUrl.fromLocalFile(str(path.resolve())))
         self.start_ms = 0
         self.end_ms = 0  # will be filled in by on_duration once Qt knows the length
+        self.clips = []  # a new file starts with a fresh clip list
+        self._clip_seq = 0
+        self.refresh_clips()
         self.slider.set_marks(0, 0)  # clear any old marks on the seek bar
         self.wave.set_timeline(0, self._slider_inset())  # until duration is known
         self.wave.set_playhead(-1)
@@ -836,15 +1006,23 @@ class Clipper(QWidget):
         self.wave.update()
 
     def _wave_done(self, code, _status):
-        """Drain the pipe, normalize levels to 0..1, show or hide the strip."""
+        """Drain the pipe, map RMS levels onto 0..1 on a fixed dB scale, show."""
         if self.wave_proc is not None:
             self._wave_read()                # drain whatever is left in the pipe
         if self.wave_cnt:                    # partial last bucket
             self.wave.levels.append(math.sqrt(self.wave_acc / self.wave_cnt))
         levels = self.wave.levels
-        peak = max(levels) if levels else 0.0
-        if peak > 0:
-            self.wave.set_levels([min(1.0, lv / peak) for lv in levels])
+        if levels and max(levels) > 0:
+            # Map each bucket's RMS level to dB relative to full scale and
+            # then onto 0..1 over a fixed WAVE_FLOOR_DB..0 dB window. An
+            # absolute scale (not peak normalization) keeps the colors
+            # meaningful: quiet parts of a loud file still show green.
+            floor = WAVE_FLOOR_DB
+            self.wave.set_levels([
+                min(1.0, max(0.0, (20 * math.log10(max(lv, 1e-9)) - floor)
+                             / -floor))
+                for lv in levels
+            ])
         else:
             # no audio stream (ffmpeg exits non-zero when there is nothing to
             # decode) -> keep the strip visible with a placeholder
@@ -943,6 +1121,111 @@ class Clipper(QWidget):
         self.update_range_label()
 
     # ------------------------------------------------------------------
+    # Clip list (collect several ranges for multi-clip export)
+    # ------------------------------------------------------------------
+    def add_clip(self):
+        """Add the currently marked range to the clip list under a default
+        name, and open that name's editor so it can be renamed right away."""
+        if not self.path:
+            self.status.setText("Open a media file first.")
+            return
+        if self.end_ms <= self.start_ms:
+            self.status.setText("Set a valid range first (end after start).")
+            return
+        self._clip_seq += 1
+        name = f"clip{self._clip_seq:02d}"
+        self.clips.append((name, self.start_ms, self.end_ms))
+        self.refresh_clips()
+        item = self.clip_list.topLevelItem(len(self.clips) - 1)
+        self.clip_list.setCurrentItem(item)
+        self.clip_list.editItem(item, 0)  # name editor opens immediately
+        self.status.setText(
+            f"Added clip '{name}': {fmt(self.start_ms)} - {fmt(self.end_ms)}")
+
+    def rename_clip(self):
+        """Open the name editor for the selected clip (F2 does the same)."""
+        item = self.clip_list.currentItem()
+        if item is not None:
+            self.clip_list.editItem(item, 0)
+
+    def _clip_item_changed(self, item, col):
+        """A list cell was edited: store a sanitized name (column 0) or restore
+        the read-only range text (column 1)."""
+        if self._clip_refresh:
+            return
+        row = self.clip_list.indexOfTopLevelItem(item)
+        if not (0 <= row < len(self.clips)):
+            return
+        _, s, e = self.clips[row]
+        if col != 0:
+            # only the name column is editable; put the range text back
+            self._clip_refresh = True
+            try:
+                item.setText(1, self._range_text(s, e))
+            finally:
+                self._clip_refresh = False
+            return
+        name = safe_name(item.text(0)) or f"clip{row + 1:02d}"
+        if name != item.text(0):
+            self._clip_refresh = True
+            try:
+                item.setText(0, name)  # show the sanitized name
+            finally:
+                self._clip_refresh = False
+        self.clips[row] = (name, s, e)
+
+    def remove_clips(self):
+        """Remove the selected clip(s) from the list."""
+        rows = sorted((self.clip_list.indexOfTopLevelItem(i)
+                       for i in self.clip_list.selectedItems()), reverse=True)
+        for row in rows:
+            del self.clips[row]
+        if rows:
+            self.refresh_clips()
+            self.status.setText(f"{len(self.clips)} clip(s) left.")
+
+    def clear_clips(self):
+        """Remove all clips from the list."""
+        if self.clips:
+            self.clips = []
+            self.refresh_clips()
+            self.status.setText("Clip list cleared.")
+
+    def load_clip(self, item, _col=0):
+        """Double-clicked a clip: load its range back into the markers and seek."""
+        s, e = item.data(0, Qt.UserRole)
+        self.start_ms, self.end_ms = s, e
+        self.update_range_label()
+        self.wave_seek(s)
+
+    @staticmethod
+    def _range_text(s: int, e: int) -> str:
+        return f"{fmt(s)} -> {fmt(e)}  ({(e - s) / 1000:.2f}s)"
+
+    def refresh_clips(self):
+        """Rebuild the clip-list widget and repaint the ranges on slider/wave."""
+        self._clip_refresh = True
+        try:
+            self.clip_list.clear()
+            total = 0
+            for name, s, e in self.clips:
+                item = QTreeWidgetItem([name, self._range_text(s, e)])
+                # QTreeWidgetItem is not editable by default (unlike list
+                # items), which makes editItem()/F2 fail with "editing failed"
+                item.setFlags(item.flags() | Qt.ItemIsEditable)
+                item.setData(0, Qt.UserRole, (s, e))
+                self.clip_list.addTopLevelItem(item)
+                total += e - s
+            self.clip_total.setText(
+                f"{len(self.clips)} clip(s), {total / 1000:.2f}s total")
+            ranges = [(s, e) for _n, s, e in self.clips]
+            self.slider.set_ranges(ranges)
+            self.wave.set_ranges(ranges)
+            self.join_check.setEnabled(len(self.clips) >= 2)
+        finally:
+            self._clip_refresh = False
+
+    # ------------------------------------------------------------------
     # Export (runs ffmpeg)
     # ------------------------------------------------------------------
     def update_export_options(self, text):
@@ -960,7 +1243,12 @@ class Clipper(QWidget):
         HelpDialog("Clipper help", MAIN_HELP_HTML, self).exec()
 
     def export(self):
-        """Ask where to save, build an ffmpeg command, and run it."""
+        """Build ffmpeg job(s) and run them one after another.
+
+        With a non-empty clip list every clip is exported (one file per clip,
+        or a single joined file when "Join" is ticked); otherwise the
+        currently marked range is exported as a single job.
+        """
         # --- sanity checks before doing anything ---
         if not self.path:
             QMessageBox.information(self, "Clipper", "Open a media file first.")
@@ -969,27 +1257,77 @@ class Clipper(QWidget):
             QMessageBox.critical(self, "Clipper",
                                  "ffmpeg not found. Install it and make sure it's on your PATH.")
             return
-        if self.end_ms <= self.start_ms:
-            QMessageBox.warning(self, "Clipper", "End must be after start.")
-            return
 
-        # --- choose the output file ---
         ext = self.format_box.currentText()          # e.g. "mp4", "webm", "wav"
         spec = EXPORT_FORMATS[ext]
-        default = f"{self.path.stem}_clip.{ext}"     # e.g. holiday_clip.mp4
-        out, _ = QFileDialog.getSaveFileName(
-            self, "Export clip", str(self.path.with_name(default)),
-            f"{ext.upper()} (*.{ext});;All files (*)")
-        if not out:
-            return  # user cancelled
-        if not out.lower().endswith(f".{ext}"):
-            out += f".{ext}"  # some platforms don't append the extension for us
+        join = self.join_check.isChecked() and len(self.clips) >= 2
+        jobs: list[tuple[str, list[str]]] = []       # (output path, ffmpeg args)
 
-        # --- build the ffmpeg command ---
+        if self.clips and join:
+            # One output file holding all clips back to back.
+            default = f"{self.path.stem}_joined.{ext}"
+            out, _ = QFileDialog.getSaveFileName(
+                self, "Export joined clips", str(self.path.with_name(default)),
+                f"{ext.upper()} (*.{ext});;All files (*)")
+            if not out:
+                return  # user cancelled
+            if not out.lower().endswith(f".{ext}"):
+                out += f".{ext}"
+            jobs.append((out, self._build_join_args(ext, spec, out)))
+        elif self.clips:
+            # One file per clip: name_clip01.ext, name_clip02.ext, ...
+            default = f"{self.path.stem}.{ext}"
+            base, _ = QFileDialog.getSaveFileName(
+                self, "Export clips (base name)", str(self.path.with_name(default)),
+                f"{ext.upper()} (*.{ext});;All files (*)")
+            if not base:
+                return  # user cancelled
+            if not base.lower().endswith(f".{ext}"):
+                base += f".{ext}"
+            p = Path(base)
+            width = max(2, len(str(len(self.clips))))
+            for i, (name, s, e) in enumerate(self.clips, 1):
+                # the clip's name becomes part of the filename; fall back to
+                # the positional name if the name is empty/unusable
+                safe = safe_name(name) or f"clip{i:0{width}d}"
+                out = str(p.with_name(f"{p.stem}_{safe}{p.suffix}"))
+                jobs.append((out, self._build_args(ext, spec, s, e, out)))
+        else:
+            if self.end_ms <= self.start_ms:
+                QMessageBox.warning(self, "Clipper", "End must be after start.")
+                return
+            default = f"{self.path.stem}_clip.{ext}"     # e.g. holiday_clip.mp4
+            out, _ = QFileDialog.getSaveFileName(
+                self, "Export clip", str(self.path.with_name(default)),
+                f"{ext.upper()} (*.{ext});;All files (*)")
+            if not out:
+                return  # user cancelled
+            if not out.lower().endswith(f".{ext}"):
+                out += f".{ext}"  # some platforms don't append the extension for us
+            jobs.append((out, self._build_args(ext, spec,
+                                                self.start_ms, self.end_ms, out)))
+
+        # --- run the jobs in the background, one at a time ---
+        self.queue = jobs
+        self.job_total = len(jobs)
+        self.export_btn.setEnabled(False)  # prevent starting two exports at once
+        self._next_job()
+
+    def _export_has_video(self, spec: dict) -> bool:
+        """True when the export keeps a video stream: the source has frames,
+        the format is not audio-only and 'Audio only' is not ticked."""
+        return (self.path is not None
+                and self.path.suffix.lower() not in AUDIO_EXTS
+                and not spec["audio"]
+                and not self.audio_only_check.isChecked())
+
+    def _build_args(self, ext: str, spec: dict, start_ms: int, end_ms: int,
+                    out: str) -> list[str]:
+        """ffmpeg arguments cutting [start_ms, end_ms] from the source into `out`."""
         fast = self.fast_check.isChecked() and spec["copy"]
         # ffmpeg takes seconds, so convert from our milliseconds.
-        start = f"{self.start_ms / 1000:.3f}"
-        dur = (self.end_ms - self.start_ms) / 1000
+        start = f"{start_ms / 1000:.3f}"
+        dur = (end_ms - start_ms) / 1000
         k = self.opts_dlg.speed_factor()
         if k and not fast:
             # A speed change stretches the clip's timeline (setpts/atempo),
@@ -1019,34 +1357,95 @@ class Clipper(QWidget):
             # format's own args so they can override them (last option wins).
             # Stream copy cannot be combined with filters/codec options, so
             # they only apply when re-encoding.
-            args += self.opts_dlg.ffmpeg_args(
-                ext,
-                video=not spec["audio"] and not self.audio_only_check.isChecked())
+            args += self.opts_dlg.ffmpeg_args(ext, video=self._export_has_video(spec))
         if self.audio_only_check.isChecked() and not spec["audio"]:
             # Strip the video stream from a video-container export.
             args += ["-vn"]
         args.append(out)  # the output path always goes last
+        return args
 
-        # --- run ffmpeg in the background ---
-        self.export_btn.setEnabled(False)  # prevent starting two exports at once
-        self.status.setText("Exporting…")
+    def _build_join_args(self, ext: str, spec: dict, out: str) -> list[str]:
+        """One ffmpeg run cutting every queued clip and concatenating them.
+
+        Each clip becomes its own input (-ss/-t before -i, which cuts exactly
+        when re-encoding) and a concat filter joins them. Always re-encodes:
+        stream copy can't go through a filtergraph, so "Fast copy" is ignored
+        in Join mode. The options' video filters and the speed change are
+        applied after the concat, inside the same filter_complex.
+        """
+        clips = self.clips
+        n = len(clips)
+        video = self._export_has_video(spec)
+        args = ["-y"]
+        for _name, s, e in clips:
+            args += ["-ss", f"{s / 1000:.3f}", "-t", f"{(e - s) / 1000:.3f}",
+                     "-i", str(self.path)]
+        if video:
+            fc = "".join(f"[{i}:v][{i}:a]" for i in range(n))
+            fc += f"concat=n={n}:v=1:a=1[v0][a0]"
+            vlab, alab = "[v0]", "[a0]"
+        else:
+            fc = "".join(f"[{i}:a]" for i in range(n))
+            fc += f"concat=n={n}:v=0:a=1[a0]"
+            vlab, alab = None, "[a0]"
+        k = self.opts_dlg.speed_factor()
+        if k:
+            if vlab:
+                fc += f";[v0]setpts=PTS/{k:.3f}[v1]"
+                vlab = "[v1]"
+            fc += f";{alab}atempo={k:.3f}[a1]"
+            alab = "[a1]"
+        vf = self.opts_dlg.video_filters() if video else []
+        if vf and vlab:
+            fc += f";{vlab}" + ",".join(vf) + "[v2]"
+            vlab = "[v2]"
+        args += ["-filter_complex", fc]
+        if vlab:
+            args += ["-map", vlab]
+        args += ["-map", alab]
+        args += spec["args"]
+        if self.audio_only_check.isChecked() and not spec["audio"]:
+            args += ["-vn"]
+        args += self.opts_dlg.ffmpeg_output_args(ext, video=video)
+        args.append(out)  # the output path always goes last
+        return args
+
+    def _next_job(self):
+        """Start the next queued ffmpeg job, or report completion if none left."""
+        if not self.queue:
+            self.export_btn.setEnabled(True)
+            if self.job_total > 1:
+                self.status.setText(
+                    f"Saved all {self.job_total} clips in {Path(self._last_out).parent}")
+            elif self._last_out:
+                self.status.setText(f"Saved: {self._last_out}")
+            return
+        out, args = self.queue.pop(0)
+        done = self.job_total - len(self.queue)
+        if self.job_total > 1:
+            self.status.setText(
+                f"Exporting clip {done}/{self.job_total}: {Path(out).name}…")
+        else:
+            self.status.setText("Exporting…")
         self.proc = QProcess(self)
         # Merge stderr into stdout so we can show ffmpeg's log if something fails.
         self.proc.setProcessChannelMode(QProcess.MergedChannels)
-        # Call export_done when the process ends (code 0 = success).
-        self.proc.finished.connect(lambda code, _s: self.export_done(code, out))
+        # Call _job_done when the process ends (code 0 = success).
+        self.proc.finished.connect(lambda code, _s, o=out: self._job_done(code, o))
         self.proc.start("ffmpeg", args)
 
-    def export_done(self, code, out):
-        """Called when ffmpeg finishes; report success or show the error log."""
-        self.export_btn.setEnabled(True)
+    def _job_done(self, code, out):
+        """Called when an ffmpeg job finishes; start the next one or report."""
+        self._last_out = out
         if code == 0:
-            self.status.setText(f"Saved: {out}")
-        else:
-            # Show only the last ~1500 characters; the useful error is at the end.
-            log = bytes(self.proc.readAll()).decode(errors="replace")[-1500:]
-            self.status.setText("Export failed.")
-            QMessageBox.critical(self, "ffmpeg error", log)
+            self._next_job()
+            return
+        # Show only the last ~1500 characters; the useful error is at the end.
+        log = bytes(self.proc.readAll()).decode(errors="replace")[-1500:]
+        self.queue.clear()               # abort the remaining jobs
+        self.export_btn.setEnabled(True)
+        self.status.setText("Export failed.")
+        QMessageBox.critical(self, "ffmpeg error", log)
 
 
 # Standard Python entry point: only runs when executed directly,
