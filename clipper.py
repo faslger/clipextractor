@@ -38,7 +38,10 @@ How it is put together:
       seconds when building the ffmpeg command.
 """
 import array
+import ctypes.util
 import math
+import os
+import subprocess
 import shlex
 import shutil
 import sys
@@ -55,6 +58,65 @@ from PySide6.QtWidgets import (
     QStyleOptionSlider, QTextBrowser, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
     QWidget,
 )
+
+# Verbose/debug mode: pass --verbose or set CLIPPER_DEBUG=1 to print runtime
+# diagnostics (PySide6 version, Qt platform plugin, ffmpeg/ffprobe versions)
+# and to enable Qt's multimedia debug logging on stderr.
+DEBUG = "--verbose" in sys.argv or bool(os.environ.get("CLIPPER_DEBUG"))
+
+
+def linux_media_hint() -> str | None:
+    """Software probe for QtMultimedia's decoding backend (Linux only).
+
+    Qt 6.5+ decodes media with FFmpeg (system libav* libraries, or the copies
+    bundled inside the PySide6 wheel); older Qt builds use GStreamer. A bare
+    GTK desktop such as Mint/Cinnamon often has neither. Returns a short
+    install hint when nothing can be found, or None when a backend looks
+    present. This is advisory only: a wrong guess shows an extra dialog,
+    it never blocks the app.
+    """
+    if any(ctypes.util.find_library(n) for n in ("avcodec", "avformat", "avutil")):
+        return None  # system FFmpeg libraries found
+    if ctypes.util.find_library("gstreamer-1.0"):
+        return None  # GStreamer found
+    try:  # the PySide6 wheel may bundle its own libs next to the package
+        import PySide6
+        base = Path(PySide6.__file__).parent
+        if any(base.glob("**/libavcodec*")):
+            return None
+    except Exception:
+        pass
+    return (
+        "No media decoding backend could be found. Preview playback will "
+        "likely fail until one is installed.\n\n"
+        "Debian / Ubuntu / Mint:\n"
+        "  sudo apt install ffmpeg libavcodec-extra gstreamer1.0-plugins-base "
+        "gstreamer1.0-plugins-good gstreamer1.0-plugins-bad "
+        "gstreamer1.0-plugins-ugly gstreamer1.0-libav\n\n"
+        "Fedora: sudo dnf install gstreamer1-plugins-{base,good,bad-free,ugly-free} ffmpeg\n\n"
+        "Windows / macOS: reinstall PySide6 (pip install --force-reinstall PySide6)."
+    )
+
+
+def ffprobe_ok(path: Path) -> bool | None:
+    """Quick pre-check that a file really contains a media stream.
+
+    Runs ffprobe (when available) before handing the file to Qt, so unreadable
+    or non-media files get a clear message instead of a player error deep in
+    the backend. Returns True/False, or None when ffprobe is not installed
+    (in which case the check is skipped, exactly like before).
+    """
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=format_name",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None  # probe problems are not the file's fault; skip the check
+    return r.returncode == 0
+
 
 # Extensions we treat as audio-only inputs: they play sound but have no
 # frames, so the video pane is hidden when one of these is loaded.
@@ -903,6 +965,9 @@ class Clipper(QWidget):
         # The player tells us when the playhead moves / the file length is known.
         self.player.positionChanged.connect(self.on_position)
         self.player.durationChanged.connect(self.on_duration)
+        # Decoding problems (bad codec, missing backend) arrive here instead
+        # of crashing the process; _player_error shows what went wrong.
+        self.player.errorOccurred.connect(self._player_error)
 
         # Waveform interactions: click/drag seeks, Shift+drag marks the range.
         self.wave.seekRequested.connect(self.wave_seek)
@@ -922,9 +987,79 @@ class Clipper(QWidget):
         ]:
             QShortcut(QKeySequence(key), self, activated=fn)
 
+        # Startup health checks: warn early about a missing ffmpeg or a broken
+        # media backend instead of failing later deep inside a codec library.
+        self._startup_checks()
+
         # Optional: a file path passed on the command line is opened immediately.
         if len(sys.argv) > 1:
             self.load(Path(sys.argv[1]))
+
+    def _startup_checks(self):
+        """Non-blocking startup diagnostics shown in the status line / dialogs."""
+        warnings: list[str] = []
+        if not shutil.which("ffmpeg"):
+            warnings.append("ffmpeg not found — waveform and export disabled. "
+                            "Install ffmpeg and make sure it's on your PATH.")
+            self.status.setText("WARNING: ffmpeg not found — exports disabled.")
+        if sys.platform.startswith("linux"):
+            hint = linux_media_hint()
+            if hint is not None:
+                QMessageBox.warning(
+                    self, "Clipper — media backend", hint)
+                warnings.append("media backend not found")
+        if DEBUG:
+            try:
+                import importlib.metadata as md
+                ver = md.version("PySide6")
+            except Exception:
+                ver = "?"
+            print(f"[clipper] Python {sys.version.split()[0]}, "
+                  f"PySide6 {ver}, platform plugin "
+                  f"{QApplication.platformName()!r}", file=sys.stderr)
+            for tool in ("ffmpeg", "ffprobe"):
+                found = shutil.which(tool)
+                print(f"[clipper] {tool}: {found or 'NOT FOUND'}", file=sys.stderr)
+            if warnings:
+                print(f"[clipper] startup warnings: {warnings}", file=sys.stderr)
+
+    # ------------------------------------------------------------------
+    # Playback error handling
+    # ------------------------------------------------------------------
+    def _player_error(self, err, msg):
+        """QMediaPlayer failed (bad codec, unreadable file, broken backend).
+
+        Qt reports the error here instead of crashing, so we surface it as a
+        dialog with a troubleshooting hint and reset the UI to a usable state.
+        """
+        print(f"[clipper] QMediaPlayer error {err!r}: {msg}", file=sys.stderr)
+        if err == QMediaPlayer.Error.NoError:
+            return  # a stale signal fired with no error attached
+        hints = {
+            QMediaPlayer.Error.FormatError:
+                "The file's container or codecs may not be supported by the "
+                "installed media backend. On Linux install ffmpeg and the "
+                "GStreamer plugins (see the startup warning); on Windows/macOS "
+                "reinstalling PySide6 usually fixes this.",
+            QMediaPlayer.Error.ResourceError:
+                "The file could not be read. Check that it still exists and "
+                "that you have permission to open it.",
+            QMediaPlayer.Error.MediaOutOfRange:
+                "The requested play position lies outside the file.",
+        }
+        text = f"Playback failed:\n{msg}"
+        if err in hints:
+            text += "\n\n" + hints[err]
+        QMessageBox.critical(self, "Playback error", text)
+        # Reset to a sane, usable state (no half-loaded UI left behind).
+        self.previewing = False
+        self.status.setText(f"Playback error: {msg}")
+        self.slider.setRange(0, 0)
+        self.slider.set_marks(0, 0)
+        self.wave.set_timeline(0, self._slider_inset())
+        self.wave.set_playhead(-1)
+        self.wave.set_levels([], "")
+        self.time_lbl.setText("00:00:00.000 / 00:00:00.000")
 
     # ------------------------------------------------------------------
     # File loading and playback
@@ -938,6 +1073,24 @@ class Clipper(QWidget):
 
     def load(self, path: Path):
         """Load a media file into the player and reset the markers."""
+        # Sanity checks first: nothing good can come from feeding Qt an
+        # unreadable or non-media file.
+        try:
+            if not path.exists() or path.stat().st_size == 0:
+                QMessageBox.warning(self, "Clipper",
+                                    f"The file does not exist or is empty:\n{path}")
+                return
+        except OSError as e:
+            QMessageBox.warning(self, "Clipper",
+                                f"The file cannot be read:\n{path}\n\n{e}")
+            return
+        probe = ffprobe_ok(path)
+        if probe is False:  # None = ffprobe absent, skip the check silently
+            QMessageBox.warning(self, "Clipper",
+                                "ffprobe could not find a readable audio or video "
+                                f"stream in this file:\n{path}\n\n"
+                                "The file may be corrupt or not a media file.")
+            return
         self.path = path
         # Qt wants a URL, not a plain path; resolve() makes it absolute first.
         self.player.setSource(QUrl.fromLocalFile(str(path.resolve())))
@@ -1430,18 +1583,41 @@ class Clipper(QWidget):
         self.proc = QProcess(self)
         # Merge stderr into stdout so we can show ffmpeg's log if something fails.
         self.proc.setProcessChannelMode(QProcess.MergedChannels)
-        # Call _job_done when the process ends (code 0 = success).
-        self.proc.finished.connect(lambda code, _s, o=out: self._job_done(code, o))
+        # Call _job_done when the process ends (code 0 = success), passing the
+        # exit status too so a crash (OOM kill, segfault) is reported, not hidden.
+        self.proc.finished.connect(
+            lambda code, status, o=out: self._job_done(code, status, o))
+        # Catch spawn failures (ffmpeg vanished from PATH) as their own event.
+        self.proc.errorOccurred.connect(
+            lambda e, o=out: self._proc_error(e, o))
         self.proc.start("ffmpeg", args)
 
-    def _job_done(self, code, out):
+    def _proc_error(self, error, out):
+        """The ffmpeg process could not start or died abnormally."""
+        if error == QProcess.ProcessError.FailedToStart:
+            self.queue.clear()
+            self.export_btn.setEnabled(True)
+            self.status.setText("Export failed.")
+            QMessageBox.critical(self, "Clipper",
+                                 "ffmpeg could not be started. Install it and "
+                                 "make sure it's on your PATH.")
+        else:
+            # Crash / write errors: log it; finished() still fires for
+            # crashes with a nonzero code and _job_done shows the message.
+            print(f"[clipper] ffmpeg process error {error!r} for {out}",
+                  file=sys.stderr)
+
+    def _job_done(self, code, status, out):
         """Called when an ffmpeg job finishes; start the next one or report."""
         self._last_out = out
-        if code == 0:
+        if code == 0 and status != QProcess.ExitStatus.CrashExit:
             self._next_job()
             return
         # Show only the last ~1500 characters; the useful error is at the end.
         log = bytes(self.proc.readAll()).decode(errors="replace")[-1500:]
+        if not log.strip():  # crash with no output (killed, segfault...)
+            log = (f"ffmpeg exited abnormally (code {code}, "
+                   f"status {'crashed' if status == QProcess.ExitStatus.CrashExit else 'normal'}).")
         self.queue.clear()               # abort the remaining jobs
         self.export_btn.setEnabled(True)
         self.status.setText("Export failed.")
@@ -1451,6 +1627,11 @@ class Clipper(QWidget):
 # Standard Python entry point: only runs when executed directly,
 # not when this file is imported by another script.
 if __name__ == "__main__":
+    if DEBUG:
+        # Turn on Qt's own multimedia/mediaplayer debug logging on stderr so
+        # backend problems (this app's most common failure mode) are visible.
+        os.environ.setdefault("QT_LOGGING_RULES",
+                              "*.debug=false;qt.multimedia.*.debug=true")
     app = QApplication(sys.argv)  # Qt needs one application object per program
     w = Clipper()
     w.show()
